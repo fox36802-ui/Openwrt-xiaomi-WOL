@@ -6,6 +6,7 @@
 #   ./build.sh                                   # 用 prebuilt/<arch> 里已有的二进制直接打包
 #   ./build.sh --toolchain <路径>                 # 用 musl 交叉工具链重新编译后再打包
 #   ./build.sh --arch aarch64 --toolchain <路径>  # 指定目标架构（默认 x86_64）
+#   ./build.sh --cc gcc                          # 直接用本机编译器（在 Alpine 等 musl 环境里用）
 #
 # 工具链获取（约 110MB，解压后即可用）：
 #   curl -LO https://musl.cc/x86_64-linux-musl-cross.tgz
@@ -15,6 +16,7 @@
 # 为什么用 musl 交叉工具链静态编译，而不是 OpenWrt SDK：
 #   本程序不依赖 libuci / libubox，静态链接后与固件的 libc 版本完全无关，
 #   在 24.10 / 25.12 / 各家用魔改固件上都能直接跑，省掉几百 MB 的 SDK。
+#   （musl.cc 经常连不上，CI 里改用 Alpine 容器 + --cc gcc 原生编译）
 #
 # License: MIT
 
@@ -22,12 +24,14 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOOLCHAIN=""
+CC_OVERRIDE=""
 ARCH="x86_64"
 VERSION="2.1.7"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--toolchain) TOOLCHAIN="${2:-}"; shift 2 ;;
+		--cc)        CC_OVERRIDE="${2:-}"; shift 2 ;;
 		--arch)      ARCH="${2:-}"; shift 2 ;;
 		-h|--help)
 			sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
@@ -48,7 +52,14 @@ esac
 
 BIN="$ROOT/prebuilt/$ARCH/cloud_control"
 
-if [ -n "$TOOLCHAIN" ]; then
+if [ -n "$CC_OVERRIDE" ]; then
+	# 直接用指定的编译器（例如在 Alpine 容器里就是原生 gcc，
+	# 目标本身就是 musl，静态链接后同样零依赖）
+	CC="$CC_OVERRIDE"
+	STRIP_CMD="strip"
+	READELF_CMD="readelf"
+	DO_COMPILE=1
+elif [ -n "$TOOLCHAIN" ]; then
 	# 允许两种布局：<toolchain>/ 或 <toolchain>/<arch>-linux-musl-cross/
 	CC=""
 	PREFIX=""
@@ -60,22 +71,29 @@ if [ -n "$TOOLCHAIN" ]; then
 		fi
 	done
 	[ -n "$CC" ] || die "在 $TOOLCHAIN 下找不到 $ARCH-linux-musl-gcc"
+	STRIP_CMD="${PREFIX}strip"
+	READELF_CMD="${PREFIX}readelf"
+	DO_COMPILE=1
+else
+	DO_COMPILE=0
+fi
 
-	info "编译 cloud_control.c（$ARCH，静态、-Os）"
+if [ "$DO_COMPILE" = "1" ]; then
+	info "编译 cloud_control.c（$ARCH，静态、-Os，编译器 $CC）"
 	mkdir -p "$(dirname "$BIN")"
 	"$CC" -static -no-pie -Os -Wall -Wextra \
 		-DCC_VERSION=\"$VERSION\" \
 		-o "$BIN" "$ROOT/cloud-control/src/cloud_control.c"
 
-	if [ -x "${PREFIX}strip" ]; then "${PREFIX}strip" "$BIN"; fi
+	if command -v "$STRIP_CMD" >/dev/null 2>&1; then "$STRIP_CMD" "$BIN"; fi
 
 	info "校验产物"
-	"${PREFIX}readelf" -h "$BIN" | grep -q 'EXEC' || die "产物不是静态可执行文件"
-	if "${PREFIX}readelf" -d "$BIN" 2>/dev/null | grep -q NEEDED; then
+	"$READELF_CMD" -h "$BIN" | grep -q 'EXEC' || die "产物不是静态可执行文件"
+	if "$READELF_CMD" -d "$BIN" 2>/dev/null | grep -q NEEDED; then
 		die "产物仍有动态库依赖，请检查编译参数"
 	fi
 else
-	[ -x "$BIN" ] || die "prebuilt/$ARCH 里没有二进制，请用 --toolchain 指定工具链编译"
+	[ -x "$BIN" ] || die "prebuilt/$ARCH 里没有二进制，请用 --toolchain 或 --cc 指定编译器"
 	info "使用已有二进制：$BIN"
 fi
 
