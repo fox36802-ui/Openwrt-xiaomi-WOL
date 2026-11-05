@@ -35,6 +35,7 @@
 #include <signal.h>
 #include <time.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -314,6 +315,166 @@ static void url_encode(const char *in, char *out, size_t outsz)
 /* ------------------------------------------------------------------ */
 /* 日志                                                               */
 /* ------------------------------------------------------------------ */
+
+/*
+ * 时区：本次进程最终使用的 TZ 值与其来源，仅供 -t 测试模式打印排查信息。
+ * 空串表示没有从环境变量或配置文件拿到任何时区，此时实际生效的是 libc 的回落行为
+ * （读 /etc/localtime，该文件也不存在才是 UTC）—— 因此这里只说「未设置」，
+ * 不承诺是 UTC，真正的偏移由 cc_tz_offset_sec() 实测后打印。
+ */
+static char g_tz_value[64] = "";
+static const char *g_tz_source = "默认";
+
+#define SYSTEM_CFG_PATH     "/etc/config/system"
+
+/*
+ * cc_tz_offset_sec() 取不到偏移时的哨兵值。
+ * 不能用 0：0 表示「真的是 UTC+0」，两者必须能区分开，否则诊断行又会说假话。
+ */
+#define CC_TZ_OFFSET_UNKNOWN    INT_MIN
+
+/*
+ * cc_init_timezone - 自行解析 OpenWrt 时区并注入环境变量 TZ。
+ *
+ * 为什么需要它：
+ *   log_write() 用 localtime_r() 生成时间戳，而 localtime_r() 依赖环境变量 TZ，
+ *   TZ 未设置时由 libc 自行决定时区（OpenWrt 上通常是 UTC）。本进程由 procd 拉起，
+ *   而 OpenWrt 只在 /etc/profile 里给登录 shell 设置 TZ，procd 与 LuCI 调起的进程
+ *   环境里都没有 TZ，于是日志时间戳比本地时间差出一个时区偏移（中国时区早 8 小时）。
+ *   在程序内部自行解析，一处修复即可覆盖 procd 托管、-t 测试、手工前台运行所有入口，
+ *   也不必依赖某一条启动路径去注入环境变量。
+ */
+static void cc_init_timezone(void)
+{
+    const char *env;
+    FILE *fp;
+    char line[256];
+    char tz[64];
+    int got = 0;
+
+    /* 外部环境已经给了非空 TZ：尊重它，绝不覆盖 */
+    env = getenv("TZ");
+    if (env != NULL && env[0] != '\0') {
+        cc_strlcpy(g_tz_value, env, sizeof(g_tz_value));
+        g_tz_source = "环境变量";
+        return;
+    }
+
+    memset(tz, 0, sizeof(tz));
+
+    fp = fopen(SYSTEM_CFG_PATH, "r");
+    if (fp == NULL)
+        return;             /* 文件不存在（非 OpenWrt 环境）：不动 TZ */
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *p = line;
+        char quote = '\0';
+        size_t n = 0;
+
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        /* 空行与整行注释（含被 # 注释掉的 option timezone）一律跳过 */
+        if (*p == '\0' || *p == '\n' || *p == '\r' || *p == '#')
+            continue;
+
+        if (strncmp(p, "option", 6) != 0 ||
+            !(p[6] == ' ' || p[6] == '\t'))
+            continue;
+
+        p += 6;
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        /* key 必须是 timezone，且后面要紧跟分隔符才算是这个键 */
+        if (strncmp(p, "timezone", 8) != 0 ||
+            !(p[8] == ' ' || p[8] == '\t'))
+            continue;
+
+        p += 8;
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        /* 值通常是单引号包裹的 POSIX TZ 串，也兼容双引号与无引号 */
+        if (*p == '\'' || *p == '"') {
+            quote = *p;
+            p++;
+        }
+
+        while (p[n] != '\0' && p[n] != '\n' && p[n] != '\r') {
+            if (quote != '\0') {
+                if (p[n] == quote)
+                    break;
+            } else if (p[n] == ' ' || p[n] == '\t') {
+                break;
+            }
+            n++;
+        }
+
+        if (n >= sizeof(tz))
+            n = sizeof(tz) - 1;
+
+        memcpy(tz, p, n);
+        tz[n] = '\0';
+
+        /*
+         * 裁掉值首尾的空白：'CST-8 ' 这种尾随空格会让 TZ 变成 "CST-8 "，
+         * 是非法的 POSIX TZ 串，libc 会静默回落到默认值 —— 修复等于失效，
+         * 而且不会有任何报错，极难排查。前导空白同理。
+         * cc_trim 原地去掉尾部空白并返回首个非空白字符，前导部分用 memmove 搬回。
+         */
+        {
+            char *t = cc_trim(tz);
+
+            if (t != tz)
+                memmove(tz, t, strlen(t) + 1);
+        }
+
+        if (tz[0] != '\0') {
+            got = 1;
+            break;
+        }
+        /* 值为空：继续看后面的行，可能存在多条 timezone 配置 */
+    }
+
+    fclose(fp);
+
+    if (!got)
+        return;             /* 没有配置时区：不动 TZ，交给 libc 的回落行为 */
+
+    setenv("TZ", tz, 1);
+    tzset();
+    cc_strlcpy(g_tz_value, tz, sizeof(g_tz_value));
+    g_tz_source = SYSTEM_CFG_PATH;
+}
+
+/*
+ * cc_tz_offset_sec - 当前生效时区相对 UTC 的偏移（秒）。
+ *
+ * 为什么需要它：
+ *   TZ 没拿到时，实际生效的时区由 libc 决定（读 /etc/localtime，读不到才是 UTC），
+ *   我们并没有控制权。与其在诊断信息里「猜」成 UTC，不如把真实偏移取出来，
+ *   如实告诉使用者日志现在到底是哪个偏移。必须在 cc_init_timezone() 之后调用，
+ *   否则读到的是未初始化的时区。
+ *
+ * 取值方式：直接读 localtime_r() 填好的 tm_gmtoff。
+ *   曾经用「localtime 时分 − gmtime 时分」自己换算，那套算法假定偏移必在 ±12 小时
+ *   以内，会把 +12:45（查塔姆群岛）、+13（新西兰夏令时）、+14（基里巴斯）这类
+ *   时区符号翻反、并整体差 24 小时 —— 比不打印更误导。tm_gmtoff 是 glibc 与 musl
+ *   都提供的扩展字段（本文件已定义 _GNU_SOURCE），直接用它没有这些假设。
+ */
+static int cc_tz_offset_sec(void)
+{
+    time_t now = time(NULL);
+    struct tm lt;
+
+    memset(&lt, 0, sizeof(lt));
+
+    if (localtime_r(&now, &lt) == NULL)
+        return CC_TZ_OFFSET_UNKNOWN;
+
+    return (int)lt.tm_gmtoff;
+}
 
 /* 打开（或重新打开）日志文件。 */
 static void log_open(void)
@@ -2497,6 +2658,13 @@ int main(int argc, char **argv)
     const char *test_mode = NULL;
     int rc = 0;
 
+    /*
+     * 必须最先执行：之后任何 log_write() 都会取 localtime_r() 生成时间戳，
+     * 而 localtime_r() 依赖 TZ。放在 getopt 之前，保证包括 -h/-t 在内的
+     * 所有路径在任何日志输出前都已完成时区初始化。
+     */
+    cc_init_timezone();
+
     while ((opt = getopt(argc, argv, "dt:h")) != -1) {
         switch (opt) {
         case 'd':
@@ -2519,6 +2687,30 @@ int main(int argc, char **argv)
         g_verbose = 1;
         g_log_to_stdout = 1;
         g_log_to_file = 0;
+
+        /*
+         * 三种测试模式都先报一行时区：日志时间对不对，取决于这一行。
+         * 「实际偏移」取自 tm_gmtoff，是 libc 真正在用的值，不是猜的：
+         * TZ 没拿到时真正生效的时区由 libc 决定，只有读出来才说得准。
+         * 取不到就如实写「未知」，绝不拿 UTC+00:00 冒充。
+         */
+        {
+            int off = cc_tz_offset_sec();
+
+            if (off == CC_TZ_OFFSET_UNKNOWN) {
+                fprintf(stdout, "时区：TZ=%s（来源：%s）  实际偏移 未知\n",
+                        (g_tz_value[0] != '\0') ? g_tz_value : "(未设置)",
+                        g_tz_source);
+            } else {
+                int mag = (off < 0) ? -off : off;
+                const char *sign = (off < 0) ? "-" : "+";
+
+                fprintf(stdout,
+                        "时区：TZ=%s（来源：%s）  实际偏移 UTC%s%02d:%02d\n",
+                        (g_tz_value[0] != '\0') ? g_tz_value : "(未设置)",
+                        g_tz_source, sign, mag / 3600, (mag % 3600) / 60);
+            }
+        }
 
         memset(&cfg, 0, sizeof(cfg));
         if (cfg_load(&cfg) != 0) {

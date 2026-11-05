@@ -95,6 +95,7 @@
 | procd 托管 | 崩溃自动拉起，`SIGTERM` 优雅退出 |
 | 日志轮转 | 超过上限（默认 256 KB）转成 `.log.1`，不会写满内存盘 |
 | 敏感信息脱敏 | `client_id` 只记前 4 位，密码永不落日志 |
+| 日志时区 | 读 `/etc/config/system` 的 `timezone`，日志时间与路由器本地时间一致 |
 | 分包容错 | 4 KB 行缓冲，TCP 半包不会丢指令 |
 
 **界面**
@@ -387,6 +388,20 @@ ls /usr/share/luci/menu.d/luci-app-cloud-control.json
 ```
 
 然后浏览器 `Ctrl+F5`。
+
+### 日志时间和路由器对不上
+
+2.1.8 之前日志是按 **UTC** 记录的。`log_write()` 依赖 `TZ` 环境变量，而守护进程由 procd
+拉起，环境里没有这个变量（OpenWrt 只在 `/etc/profile` 给登录 shell 设置），
+`localtime_r()` 于是退回 UTC。现在程序启动时会自行读取 `/etc/config/system` 的 `timezone`。
+
+如果时间仍然不对：
+
+- 点任意一个「测试」按钮，**首行**会打印当前时区与实测偏移，例如
+  `时区：TZ=CST-8（来源：/etc/config/system）  实际偏移 UTC+08:00`
+- 偏移正确说明时区已生效，时间还不对就是系统时间本身的问题，`date` 看一下
+- 显示「来源：默认」说明没从配置读到，检查 `/etc/config/system` 里有没有 `option timezone 'CST-8'`
+- 环境变量 `TZ` 优先级最高，被别的脚本设过的话会覆盖配置里的值
 
 ### 日志在哪
 

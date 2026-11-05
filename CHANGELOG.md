@@ -3,6 +3,24 @@
 本项目的所有重要变更都记录在这里。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.8] - 2026-11-05
+
+### 修复
+- **日志时间与路由器本地时间不符（显示为 UTC，差 8 小时）。**
+  `log_write()` 用 `localtime_r()` 生成时间戳，而它依赖 `TZ` 环境变量；
+  守护进程由 procd 拉起，环境里没有 `TZ`（OpenWrt 只在 `/etc/profile` 里给登录 shell 设置），
+  于是按 UTC 处理。现在程序启动时自行读取 `/etc/config/system` 的 `option timezone`
+  并 `setenv("TZ")` + `tzset()`，一处修复同时覆盖守护进程和 `-t` 三种测试模式。
+  环境变量已有 `TZ` 时不覆盖；配置缺失时行为与修复前一致。
+- 时区值首尾空白自动裁剪。`option timezone 'CST-8 '` 这类写法原本会得到非法的
+  `"CST-8 "`，libc 静默回落 UTC，修复等于失效且没有任何报错。
+
+### 新增
+- 三种测试模式（`-t wol|ssh|cloud`）首行输出当前时区与**实测** UTC 偏移，例如
+  `时区：TZ=CST-8（来源：/etc/config/system）  实际偏移 UTC+08:00`。
+  偏移取自 `tm_gmtoff`，`+12:45` / `+13` / `+14` 这类超出 ±12 小时的时区也能正确显示；
+  无法计算时明确打印「实际偏移 未知」，不冒充 `UTC+00:00`。
+
 ## [2.1.7] - 2026-11-05
 
 首个公开发布版本。
