@@ -29,7 +29,7 @@ OpenWrt 官方从 25.12 起把包管理器从 opkg 换成了 apk，.ipk 已经�
 二、为什么是静态二进制
 ------------------------------------------------------------------------
 
-/usr/bin/cloud_control 是 86KB 的静态链接 ELF，不依赖 libuci、libubox、
+/usr/bin/cloud_control 是 86–104KB 的静态链接 ELF，不依赖 libuci、libubox、
 musl/glibc 版本，也不依赖 etherwake（魔术包由程序自己发 UDP）。
 
 也就是说：换固件版本、换 libc 都不会出现「装上了但跑不起来」。
@@ -199,7 +199,7 @@ SSH 关机失败
 九、文件清单
 ------------------------------------------------------------------------
 
-files/usr/bin/cloud_control                              静态二进制 86KB
+files/usr/bin/cloud_control                              静态二进制 86–104KB
 files/ARCH                                               该包的架构标记（装错架构会被拦下）
 files/etc/config/cloud_control                           默认配置
 files/etc/init.d/cloud_control                           procd 启动脚本

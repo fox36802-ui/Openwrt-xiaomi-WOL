@@ -145,7 +145,7 @@ OpenWrt 官方从 25.12 起把包管理器从 **opkg 换成了 apk**，`.ipk` �
 
 ### 为什么是静态二进制
 
-`/usr/bin/cloud_control` 是 `ELF64 EXEC` 的静态链接产物：无 `INTERP` 段、无 `NEEDED` 依赖，约 86 KB。
+`/usr/bin/cloud_control` 是 `ELF64 EXEC` 的静态链接产物：无 `INTERP` 段、无 `NEEDED` 依赖，约 86 KB（x86_64）/ 104 KB（aarch64）。
 
 它不链接 libuci / libubox，配置由程序自己解析；也不调用 `etherwake`，魔术包自己发。换来的是：**换固件版本、换 libc 都不会出现「装上了但起不来」**。
 
