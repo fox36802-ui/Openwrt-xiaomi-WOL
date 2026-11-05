@@ -149,15 +149,15 @@ SSH 关机失败
   → 日志里出现 "Connection ... exited: Interrupted." 且命令没执行：
     这句话出自 dbclient 的 getpass() 失败分支，含义是「需要密码，但没有终端可输」。
     也就是说公钥认证没成功，客户端退到了密码认证。
-    2.1.7 起改为显式 -i 指定私钥，并在找不到私钥时直接报路径，不再静默降级。
+    本版已改为显式 -i 指定私钥，并在找不到私钥时直接报路径，不再静默降级。
     自检：在路由器上直接跑
         ssh -y -p 22 用户@IP "echo OK"
     不用输密码就返回 OK，才说明密钥认证已生效。
   → 日志里出现 "Ignoring unknown configuration option" 或
-    "Didn't validate host key"：2.0.4 以前的版本会遇到
+    "Didn't validate host key"：
       · 原因：固件的 /usr/bin/ssh 是 dropbear 的 dbclient，
         它不认 OpenSSH 的 -o 参数，转而去问交互问题
-      · 2.0.4 起会自动识别 dropbear / OpenSSH，分别下参数
+      · 本版会自动识别 dropbear / OpenSSH，分别下参数
   → 其他：没装 OpenSSH 服务器 / 目标机 IP 变了
 
 提示「未找到 sshpass」
