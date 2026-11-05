@@ -93,7 +93,7 @@ jobs:
             echo "::error::产物仍有动态库依赖"
             exit 1
           fi
-          ls -lh "luci-app-cloud-control-2.1.7-${{ matrix.arch }}.tar.gz"
+          ls -lh luci-app-cloud-control-*-${{ matrix.arch }}.tar.gz
           echo "静态、零依赖 ✓"
 
       - name: 上传压缩包
