@@ -155,7 +155,7 @@ OpenWrt 官方从 25.12 起把包管理器从 **opkg 换成了 apk**，`.ipk` �
 
 ### 方式一：预编译包（推荐）
 
-到 [Releases](https://github.com/YOUR_NAME/luci-app-cloud-control/releases) 下载对应架构的压缩包，传到路由器安装：
+到 [Releases](https://github.com/fox36802-ui/luci-app-cloud-control/releases) 下载对应架构的压缩包，传到路由器安装：
 
 ```bash
 scp luci-app-cloud-control-2.1.7-x86_64.tar.gz root@192.168.1.1:/tmp/
@@ -189,7 +189,7 @@ cd /tmp/luci-app-cloud-control && sh uninstall.sh
 ### 方式二：从源码构建
 
 ```bash
-git clone https://github.com/YOUR_NAME/luci-app-cloud-control.git
+git clone https://github.com/fox36802-ui/luci-app-cloud-control.git
 cd luci-app-cloud-control
 
 # 取 musl 交叉工具链（约 110 MB）
@@ -212,7 +212,7 @@ tar -xzf x86_64-linux-musl-cross.tgz
 ```bash
 # 把仓库放进 SDK
 cd openwrt-sdk
-echo "src-git cloudcontrol https://github.com/YOUR_NAME/luci-app-cloud-control.git" \
+echo "src-git cloudcontrol https://github.com/fox36802-ui/luci-app-cloud-control.git" \
   >> feeds.conf.default
 ./scripts/feeds update cloudcontrol
 ./scripts/feeds install -a -p cloudcontrol

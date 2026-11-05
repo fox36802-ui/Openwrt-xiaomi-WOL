@@ -14,7 +14,7 @@ PKG_VERSION:=2.1.7
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT
-PKG_MAINTAINER:=YOUR_NAME <YOUR_NAME@users.noreply.github.com>
+PKG_MAINTAINER:=fox36802-ui <fox36802-ui@users.noreply.github.com>
 
 LUCI_TITLE:=LuCI support for cloud-control (Bemfa power on/off)
 LUCI_DESCRIPTION:=Web UI to configure the cloud-control daemon.

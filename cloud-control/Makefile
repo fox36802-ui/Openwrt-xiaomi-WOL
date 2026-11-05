@@ -19,7 +19,7 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
-PKG_MAINTAINER:=YOUR_NAME <YOUR_NAME@users.noreply.github.com>
+PKG_MAINTAINER:=fox36802-ui <fox36802-ui@users.noreply.github.com>
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -27,7 +27,7 @@ define Package/cloud-control
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Cloud control daemon for Bemfa (WoL power-on / SSH shutdown)
-  URL:=https://github.com/YOUR_NAME/luci-app-cloud-control
+  URL:=https://github.com/fox36802-ui/luci-app-cloud-control
   DEPENDS:=+curl +sshpass
 endef
 
