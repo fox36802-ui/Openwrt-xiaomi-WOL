@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# 同一分支/tag 的新构建会取消上一次未完成的，避免排队堆积
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # 语法与静态检查：不产出二进制，但能挡住绝大多数低级错误
   lint:
@@ -55,12 +60,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # musl.cc 的下载经常中断（连接被重置），所以必须：
+      #   1) 设超时，不能让它无限挂着把 job 拖到 6 小时
+      #   2) 断点续传重试
+      #   3) 主源失败后换 more.musl.cc 镜像
       - name: 取 musl 交叉工具链
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          curl -fsSL --retry 3 -o tc.tgz \
-            "https://musl.cc/${{ matrix.arch }}-linux-musl-cross.tgz"
+          set -u
+          primary="https://musl.cc/${ARCH}-linux-musl-cross.tgz"
+          mirror="https://more.musl.cc/11.2.1/${ARCH}-linux-musl/${ARCH}-linux-musl-cross.tgz"
+
+          ok=0
+          for url in "$primary" "$mirror"; do
+            echo "== 下载源：$url"
+            for i in 1 2 3 4 5; do
+              if curl -fsSL -C - --connect-timeout 20 --max-time 300 -o tc.tgz "$url"; then
+                ok=1
+                break
+              fi
+              sz=$(stat -c %s tc.tgz 2>/dev/null || echo 0)
+              echo "  第 $i 次中断（已下载 ${sz} 字节），续传重试"
+              sleep 3
+            done
+            [ "$ok" = 1 ] && break
+            rm -f tc.tgz
+          done
+
+          if [ "$ok" != 1 ]; then
+            echo "::error::工具链下载失败，主源和镜像都没成功"
+            exit 1
+          fi
+
           tar -xzf tc.tgz
-          ./${{ matrix.arch }}-linux-musl-cross/bin/${{ matrix.arch }}-linux-musl-gcc --version | head -1
+          "./${ARCH}-linux-musl-cross/bin/${ARCH}-linux-musl-gcc" --version | head -1
 
       - name: 编译并打包
         run: |
