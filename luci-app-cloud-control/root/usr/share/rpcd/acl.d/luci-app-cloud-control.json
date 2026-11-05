@@ -1,0 +1,23 @@
+{
+	"luci-app-cloud-control": {
+		"description": "Grant access to Cloud Control (bemfa remote power on/off)",
+		"read": {
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "cloud_control" ],
+			"file": {
+				"/var/log/cloud_control.log": [ "read" ],
+				"/var/log/cloud_control.log.1": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "cloud_control" ],
+			"file": {
+				"/etc/init.d/cloud_control": [ "exec" ],
+				"/usr/bin/cloud_control": [ "exec" ],
+				"/var/log/cloud_control.log": [ "write" ]
+			}
+		}
+	}
+}

@@ -1,0 +1,96 @@
+name: 问题反馈
+description: 装不上、关不了机、开机没反应、界面异常
+labels: [ bug ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 先看一眼排障表
+
+        大多数问题在 [故障排查](https://github.com/YOUR_NAME/luci-app-cloud-control#故障排查)
+        里都有对应条目，尤其是：
+
+        - `exit=127` → 不是密码错，是**要执行的程序没找到**（多半缺 `sshpass`）
+        - `exited: Interrupted.` → 公钥认证没成功，退到了密码认证但没有终端
+        - 巴法云显示「离线」→ 先核对主题名，用页面上的「测试巴法云连接」校验
+
+        > ⚠️ 贴日志前请把 **SSH 密码、完整 Client ID、公网 IP** 抹掉。
+        > `client_id` 只保留前 4 位即可。
+
+  - type: input
+    id: firmware
+    attributes:
+      label: 固件与设备
+      description: 固件名称、版本号、芯片架构
+      placeholder: 例：BleachWrt mini 20260619 / R26.05.20，x86_64 软路由
+    validations:
+      required: true
+
+  - type: dropdown
+    id: arch
+    attributes:
+      label: 设备架构
+      options:
+        - x86_64
+        - aarch64 / arm64
+        - 其它（自行编译）
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 插件版本
+      description: 页面顶部或 `cloud_control -h` 可以看到；日志第一行也会打印
+      placeholder: 例：2.1.7
+    validations:
+      required: true
+
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: 问题类型
+      options:
+        - SSH 关机失败（有退出码）
+        - SSH 关机显示成功但电脑没关
+        - 开机（Wake-on-LAN）没反应
+        - 巴法云控制台显示设备离线
+        - 界面菜单不显示 / 页面空白
+        - 安装或升级失败
+        - 其它
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好，比如「点测试 SSH 关机按钮，返回 …」
+      placeholder: |
+        1. 页面填好参数，保存并应用
+        2. 点「测试 SSH 关机」
+        3. 输出显示 …
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与输出
+      description: |
+        页面「连通性测试」的完整输出（含退出码），以及
+        `tail -n 50 /var/log/cloud_control.log` 的内容。
+        贴之前记得抹掉密码和完整 Client ID。
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: 已确认
+      options:
+        - label: 目标机已安装 OpenSSH 服务器，且 `sshd` 服务在运行
+        - label: 路由器上 `ssh -y -p 22 用户@IP "echo OK"` 能免密返回 OK
+        - label: 目标机关闭了「快速启动」，BIOS 里 Wake on LAN 已开启
+        - label: 主题名与巴法云控制台、米家绑定的完全一致

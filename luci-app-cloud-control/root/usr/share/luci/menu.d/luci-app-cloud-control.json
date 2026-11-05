@@ -1,0 +1,13 @@
+{
+	"admin/services/cloud_control": {
+		"title": "云端开关机",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "cloud_control/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-cloud-control" ]
+		}
+	}
+}

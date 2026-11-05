@@ -1,0 +1,107 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 语法与静态检查：不产出二进制，但能挡住绝大多数低级错误
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell 语法（bash）
+        run: |
+          for f in build.sh install.sh uninstall.sh; do
+            bash -n "$f" && echo "OK  $f"
+          done
+
+      - name: shell 语法（POSIX sh，路由器上是 ash）
+        run: |
+          for f in install.sh uninstall.sh \
+                   luci-app-cloud-control/root/etc/init.d/cloud_control; do
+            sh -n "$f" && echo "OK  $f"
+          done
+
+      - name: JS 语法
+        run: |
+          node --check \
+            luci-app-cloud-control/htdocs/luci-static/resources/view/cloud_control/settings.js
+
+      - name: JSON 合法性
+        run: |
+          for f in $(find . -name '*.json' -not -path './.git/*'); do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" && echo "OK  $f"
+          done
+
+      - name: C 编译零告警
+        run: |
+          gcc -c -O2 -Wall -Wextra -Werror -o /dev/null cloud-control/src/cloud_control.c
+
+  # 双架构静态编译
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ x86_64, aarch64 ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取 musl 交叉工具链
+        run: |
+          curl -fsSL --retry 3 -o tc.tgz \
+            "https://musl.cc/${{ matrix.arch }}-linux-musl-cross.tgz"
+          tar -xzf tc.tgz
+          ./${{ matrix.arch }}-linux-musl-cross/bin/${{ matrix.arch }}-linux-musl-gcc --version | head -1
+
+      - name: 编译并打包
+        run: |
+          chmod +x build.sh install.sh uninstall.sh
+          ./build.sh --arch ${{ matrix.arch }} \
+                     --toolchain "$PWD/${{ matrix.arch }}-linux-musl-cross"
+
+      - name: 校验产物（必须静态、零依赖）
+        run: |
+          f="prebuilt/${{ matrix.arch }}/cloud_control"
+          file "$f"
+          readelf -h "$f" | grep -q 'EXEC'
+          if readelf -d "$f" | grep -q NEEDED; then
+            echo "::error::产物仍有动态库依赖"
+            exit 1
+          fi
+          echo "静态、零依赖 ✓"
+
+      - name: 上传压缩包
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-cloud-control-${{ matrix.arch }}
+          path: luci-app-cloud-control-*-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # 打 tag 时自动建 Release 并附上两个架构的压缩包
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ lint, build ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 列一下待发布的文件
+        run: ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true

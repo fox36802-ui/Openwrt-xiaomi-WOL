@@ -1,0 +1,16 @@
+# 路由器上的脚本必须是 LF，Windows 下编辑后自动转换会报 bad interpreter
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+# 二进制不做行尾转换
+prebuilt/*/cloud_control binary
+*.tar.gz binary
+*.ipk binary
+*.apk binary

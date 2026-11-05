@@ -1,0 +1,19 @@
+# 构建产物
+/dist/
+*.tar.gz
+*.tgz
+
+# OpenWrt / apk 包
+*.ipk
+*.apk
+
+# 编译中间文件
+# 注意：不要写 *.d —— 那会把 init.d / menu.d / acl.d 这些目录一起忽略掉
+*.o
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
