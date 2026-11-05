@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: 使用说明与故障排查
-    url: https://github.com/fox36802-ui/luci-app-cloud-control#故障排查
+    url: https://github.com/fox36802-ui/Openwrt-xiaomi-WOL#故障排查
     about: 装不上、关不了机、开机没反应，先看这张表，多数问题有现成答案

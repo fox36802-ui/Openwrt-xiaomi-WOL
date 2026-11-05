@@ -27,7 +27,7 @@ define Package/cloud-control
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Cloud control daemon for Bemfa (WoL power-on / SSH shutdown)
-  URL:=https://github.com/fox36802-ui/luci-app-cloud-control
+  URL:=https://github.com/fox36802-ui/Openwrt-xiaomi-WOL
   DEPENDS:=+curl +sshpass
 endef
 

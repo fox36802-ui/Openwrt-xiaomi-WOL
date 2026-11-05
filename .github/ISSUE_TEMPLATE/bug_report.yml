@@ -7,7 +7,7 @@ body:
       value: |
         ## 先看一眼排障表
 
-        大多数问题在 [故障排查](https://github.com/fox36802-ui/luci-app-cloud-control#故障排查)
+        大多数问题在 [故障排查](https://github.com/fox36802-ui/Openwrt-xiaomi-WOL#故障排查)
         里都有对应条目，尤其是：
 
         - `exit=127` → 不是密码错，是**要执行的程序没找到**（多半缺 `sshpass`）
