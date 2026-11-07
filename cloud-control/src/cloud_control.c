@@ -58,8 +58,13 @@
 /* 常量                                                               */
 /* ------------------------------------------------------------------ */
 
+/* 服务器地址允许编译期覆盖：便于本地起 mock 服务器做协议回归测试 */
+#ifndef BEMFA_HOST
 #define BEMFA_HOST          "bemfa.com"
+#endif
+#ifndef BEMFA_PORT
 #define BEMFA_PORT          8344
+#endif
 #define BEMFA_PUSH_URL      "https://api.bemfa.com/api/device/v1/data/3/push/get/" \
                             "?uid=%s&topic=%s&msg=%s"
 
@@ -935,15 +940,49 @@ static void uci_unquote(char *s)
         memmove(s, b, strlen(b) + 1);
 }
 
+/*
+ * 2.2.3：client_id / topic 首尾空白自动修剪（40212 根因修复）。
+ *
+ * 背景（v2.2.2 用户实测）：TCP 订阅同 uid+topic 正常在线，HTTP push 却被
+ * 巴法云拒绝 {"code":"40212","status":"topic error"}。根因是主题值带首尾
+ * 空白：uci_unquote 只裁剪引号外的空白，引号内的空白原样保留
+ * （option topic 'PC001 ' -> "PC001 "）。巴法云 TCP 侧对订阅主题做了
+ * 容错处理所以能上线，HTTP 接口则把空白 url_encode 成 %20，服务端按
+ * 原文精确匹配查不到主题 -> 40212。两个通道行为不一致导致问题极难排查。
+ *
+ * 修剪只针对这两个字段：它们是巴法云侧的精确匹配键；其它配置项
+ * （MAC、密码、命令行等）语义上允许含空白，不动。修剪发生时记一条
+ * INFO（每进程只记一次，避免守护进程 60 秒复查配置时刷屏）。
+ */
+static int g_cfg_trim_logged = 0;
+
+static void cfg_trim_key(char *dst, size_t dstsz, const char *key, const char *val)
+{
+    char buf[256];
+    char *t;
+
+    cc_strlcpy(buf, val, sizeof(buf));
+    t = cc_trim(buf);
+
+    if (strcmp(t, val) != 0 && !g_cfg_trim_logged) {
+        g_cfg_trim_logged = 1;
+        log_write("INFO", "配置项 %s 含首尾空白字符，已自动修剪"
+                  "（巴法云按原文精确匹配主题，空白会导致 HTTP 上报 40212）",
+                  key);
+    }
+
+    cc_strlcpy(dst, t, dstsz);
+}
+
 /* 把一条 option 的键值写进配置结构体；不认识的名字直接忽略。 */
 static void cfg_apply(cc_config_t *cfg, const char *key, const char *val)
 {
     if (strcmp(key, "enabled") == 0)
         cc_strlcpy(cfg->enabled, val, sizeof(cfg->enabled));
     else if (strcmp(key, "client_id") == 0)
-        cc_strlcpy(cfg->client_id, val, sizeof(cfg->client_id));
+        cfg_trim_key(cfg->client_id, sizeof(cfg->client_id), key, val);
     else if (strcmp(key, "topic") == 0)
-        cc_strlcpy(cfg->topic, val, sizeof(cfg->topic));
+        cfg_trim_key(cfg->topic, sizeof(cfg->topic), key, val);
     else if (strcmp(key, "host") == 0)
         cc_strlcpy(cfg->host, val, sizeof(cfg->host));
     else if (strcmp(key, "ssh_port") == 0)
@@ -1112,7 +1151,36 @@ static int cfg_load(cc_config_t *cfg)
 /* 巴法云上报                                                         */
 /* ------------------------------------------------------------------ */
 
-/* 向巴法云推送设备状态（on / off），返回 0 表示确认送达。 */
+/*
+ * 向巴法云推送设备状态（on / off），返回 0 表示确认送达。
+ *
+ * 2.2.3 评估结论：为什么继续用 HTTP push，不改走 TCP 长连接发布。
+ *   守护进程确实常驻 bemfa.com:8344 连接，理论上可以直接发
+ *   cmd=2&uid=..&topic=..&msg=on 发布状态（注意是 cmd=2 不是 cmd=3，
+ *   巴法云 TCP 协议：cmd=1 订阅、cmd=2 发布、响应 cmd=2&res=1）。
+ *   评估后放弃，原因：
+ *   a) 自回环：发布者自己订阅着该主题，服务器会把消息回发给本连接，
+ *      依赖 g_last_push_msg 的 10 秒回显窗口兜底——窗口外的迟到回显
+ *      仍会走 do_action，靠幂等分支「已是 on 只回报不动作」保平安，
+ *      语义上等于把上报通道的命运绑在指令处理逻辑上；
+ *   b) 发布成功≠主题正确：TCP 发布对不存在的主题会静默自动建主题并
+ *      回 res=1，配置填错（含空白、大小写）时不会像 HTTP 那样报
+ *      40212，而是悄悄建一个错名主题——小爱读的是真主题，状态永远
+ *      同步不到用户实际使用的主题上，且用户毫无感知。HTTP 的 40212
+ *      是宝贵的配置纠错信号，不应绕过；
+ *   c) 确认语义弱：cmd=2&res=1 只表示服务器收到了，需在单线程
+ *      select 循环里区分「发布回执」与「业务报文」并做超时兜底，
+ *      复杂度换不来收益；
+ *   d) 架构冲突：页面「同步状态到云端」/「重新探测」走
+ *      cloud_control -t push / -t status，是独立短命进程，根本没有
+ *      TCP 长连接；改走 TCP 意味着短命进程也要连/订/发/断，与守护
+ *      进程的双连接并发。
+ *   保留 HTTP：curl 独立进程、天然带 HTTP 状态码 + 业务码双重校验、
+ *   40212 可明确诊断配置错误；断网时由 cloud_report 的 30 秒退避补发。
+ */
+/* 最近一次推送失败的可读原因，供 -t push 等调用方透传给页面 */
+static char g_push_fail_reason[192] = "";
+
 static int bemfa_push(const cc_config_t *cfg, const char *msg)
 {
     char uid_enc[384];
@@ -1128,6 +1196,7 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
         return -1;
 
     if (cfg->client_id[0] == '\0') {
+        cc_strlcpy(g_push_fail_reason, "未配置 client_id", sizeof(g_push_fail_reason));
         log_write("WARN", "未配置 client_id，跳过云端上报");
         return -1;
     }
@@ -1139,6 +1208,7 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
 
     /* curl 参数全部为常量，URL 已做百分号编码，无 shell 参与 */
     if (find_bin("curl", curl_bin, sizeof(curl_bin)) != 0) {
+        cc_strlcpy(g_push_fail_reason, "未安装 curl", sizeof(g_push_fail_reason));
         log_write("WARN", "未安装 curl，跳过云端状态上报");
         return -1;
     }
@@ -1153,6 +1223,8 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
 
     rc = run_argv_capture(argv, NULL, NULL, 15, resp, sizeof(resp));
     if (rc != 0) {
+        snprintf(g_push_fail_reason, sizeof(g_push_fail_reason),
+                 "curl 执行失败（exit=%d，网络或 DNS 异常）", rc);
         log_write("WARN", "云端上报 msg=%s 失败（curl exit=%d）", msg, rc);
         return rc;
     }
@@ -1170,8 +1242,36 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
             char safe[512];
 
             redact_secrets(resp, safe, sizeof(safe));
-            log_write("ERROR", "云端上报 msg=%s 被巴法云拒绝（code=%ld）：%s",
-                      msg, code, safe);
+
+            if (code == 40212) {
+                cc_strlcpy(g_push_fail_reason,
+                           "巴法云返回 40212（主题不存在或与私钥不匹配，见日志指引）",
+                           sizeof(g_push_fail_reason));
+                /*
+                 * 2.2.3：40212 = 主题不存在/与私钥不匹配，给出针对性指引。
+                 * 典型坑：TCP 订阅显示在线但 HTTP 上报 40212 —— 巴法云
+                 * TCP 侧对主题做了容错，HTTP 侧按原文精确匹配；主题带
+                 * 首尾空格（配置引号内空格）时 URL 编码成 %20 后必查无
+                 * 此主题。2.2.3 起配置已自动修剪，老配置重启后生效。
+                 */
+                log_write("ERROR",
+                          "云端上报 msg=%s 被巴法云拒绝（40212 主题不存在）：%s\n"
+                          "  排查指引：1) 到巴法云控制台逐字符核对主题名，"
+                          "区分大小写、排查首尾空格（本版起配置已自动修剪，"
+                          "重启服务后生效）；\n"
+                          "  2) 确认该主题确实建在这个 UID（私钥）下；\n"
+                          "  3) TCP 订阅能上线不代表 HTTP 接口可用——"
+                          "TCP 侧容错处理了空白/容错匹配，HTTP 按 URL 编码"
+                          "后的原文精确查找；\n"
+                          "  4) 若主题是设备首次 TCP 订阅时自动创建的，"
+                          "控制台里手动重名的主题可能属于其它 UID。",
+                          msg, safe);
+            } else {
+                snprintf(g_push_fail_reason, sizeof(g_push_fail_reason),
+                         "巴法云返回业务码 %ld（详见日志）", code);
+                log_write("ERROR", "云端上报 msg=%s 被巴法云拒绝（code=%ld）：%s",
+                          msg, code, safe);
+            }
             return -1;
         }
     } else if (resp[0] != '\0') {
@@ -1184,6 +1284,7 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
     /* 只有真正发出去了才记录，供 handle_cmd 做自回显去重 */
     cc_strlcpy(g_last_push_msg, msg, sizeof(g_last_push_msg));
     g_last_push_time = time(NULL);
+    g_push_fail_reason[0] = '\0';
 
     return 0;
 }
@@ -3219,9 +3320,23 @@ static int bemfa_check_topic(const cc_config_t *cfg)
         char safe[512];
 
         redact_secrets(resp, safe, sizeof(safe));
-        log_write("ERROR", "巴法云拒绝了这个主题：code=%ld，返回：%s", code, safe);
-        log_write("ERROR", "请核对：1) 主题名与控制台完全一致（大小写、空格都算）"
-                          " 2) 该主题确实建在这个 UID 下");
+
+        if (code == 40212) {
+            /* 2.2.3：与 bemfa_push 的 40212 提示保持同一口径 */
+            log_write("ERROR",
+                      "巴法云拒绝了这个主题（40212 主题不存在）：%s\n"
+                      "  排查指引：1) 到巴法云控制台逐字符核对主题名，"
+                      "区分大小写、排查首尾空格（本版起配置已自动修剪，"
+                      "重新保存配置后生效）；\n"
+                      "  2) 确认该主题确实建在这个 UID（私钥）下；\n"
+                      "  3) TCP 订阅能上线不代表主题与 HTTP 接口一致"
+                      "——TCP 侧有容错匹配，HTTP 按原文精确查找。",
+                      safe);
+        } else {
+            log_write("ERROR", "巴法云拒绝了这个主题：code=%ld，返回：%s", code, safe);
+            log_write("ERROR", "请核对：1) 主题名与控制台完全一致（大小写、空格都算）"
+                              " 2) 该主题确实建在这个 UID 下");
+        }
         return 1;
     }
 
@@ -3568,11 +3683,14 @@ int main(int argc, char **argv)
                         msg);
             } else {
                 fprintf(stdout,
-                        "结果：失败 - 当前状态 %s 未能上报巴法云（curl exit=%d）\n"
+                        "结果：失败 - 当前状态 %s 未能上报巴法云（%s）\n"
                         "说明：云端显示可能仍是旧值。请检查 curl / 网络 / 主题名；"
+                        "若日志出现 40212，请到巴法云控制台逐字符核对主题名"
+                        "（区分大小写、排查首尾空格，确认主题建在本 UID 下）；"
                         "也可往主题发 msg=status 让守护进程回推真实状态，"
                         "或开启「周期同步状态」由守护进程在状态变化时自动补发。\n",
-                        msg, rc);
+                        msg,
+                        g_push_fail_reason[0] ? g_push_fail_reason : "未知原因");
             }
 
         } else {

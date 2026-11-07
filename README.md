@@ -247,11 +247,11 @@ OpenWrt 官方从 25.12 起把包管理器从 **opkg 换成了 apk**，`.ipk` �
 到 [Releases](https://github.com/fox36802-ui/Openwrt-xiaomi-WOL/releases) 下载对应架构的压缩包，传到路由器安装：
 
 ```bash
-scp luci-app-cloud-control-2.2.2-x86_64.tar.gz root@192.168.1.1:/tmp/
+scp luci-app-cloud-control-2.2.3-x86_64.tar.gz root@192.168.1.1:/tmp/
 
 ssh root@192.168.1.1
 cd /tmp
-tar -xzf luci-app-cloud-control-2.2.2-x86_64.tar.gz
+tar -xzf luci-app-cloud-control-2.2.3-x86_64.tar.gz
 cd luci-app-cloud-control
 sh install.sh
 ```
@@ -288,7 +288,7 @@ tar -xzf x86_64-linux-musl-cross.tgz
 ./build.sh --toolchain "$PWD/x86_64-linux-musl-cross"
 ```
 
-产物：`luci-app-cloud-control-2.2.2-x86_64.tar.gz`。
+产物：`luci-app-cloud-control-2.2.3-x86_64.tar.gz`。
 
 > ARM 设备把工具链和 `--arch` 换成 `aarch64`：
 > `curl -LO https://musl.cc/aarch64-linux-musl-cross.tgz`，然后
@@ -375,8 +375,8 @@ Restart-Service sshd
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `0` | 总开关。为 `0` 时启动脚本会跳过启动，守护进程不会连接巴法云 |
-| `client_id` | 空 | 巴法云私钥 UID（32 位，控制台「私钥」里，不是账号密码） |
-| `topic` | `PC001` | 订阅主题名，必须与控制台、米家绑定的**完全一致** |
+| `client_id` | 空 | 巴法云私钥 UID（32 位，控制台「私钥」里，不是账号密码）；2.2.3 起首尾空白自动修剪 |
+| `topic` | `PC001` | 订阅主题名，必须与控制台、米家绑定的**完全一致**；2.2.3 起首尾空白自动修剪（空白会导致 HTTP 上报 40212 而 TCP 订阅仍在线） |
 | `host` | 空 | 目标机 IPv4（兼容旧字段 `ip`） |
 | `ssh_port` | `22` | SSH 端口 |
 | `user` | 空 | SSH 用户名 |
@@ -453,7 +453,9 @@ uci commit cloud_control
 ### 巴法云控制台一直显示「离线」
 
 - **最常见：主题名对不上**（大小写、空格、全半角都算）。用「测试巴法云连接」校验，
-  填错会直接报 `code=40212 topic error`
+  填错会直接报 `code=40212 topic error`。
+  特别注意：主题带首尾空格时 **TCP 订阅能照常在线、HTTP 上报才报 40212**，
+  极具迷惑性；2.2.3 起配置读取时自动修剪首尾空白（日志会记 INFO）
 - 其次：「启用服务」没勾选，守护进程不会常驻连接
 - 再其次：服务没启动，看页面状态和日志
 
