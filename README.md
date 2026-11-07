@@ -152,7 +152,7 @@ Windows 防火墙默认丢弃 ICMP Echo，机器开着也可能 ping 不通。�
 | 云端推送状态 | 「已确认推送到云端：关机（推送成功时的本地记录；如需云端实际值，点「查询云端实际值」）」或「尚未成功推送到云端」；有待补发的状态时追加提示 |
 
 分组里的按钮：`重新探测`（只查不动；2.2.2 起探测结果与云端记录不一致时会自动推送，
-受 60 秒节流约束）、`立即开机`、`立即关机`、`重试上次动作`、
+受 60 秒节流约束）、`立即开机`（2.2.5 起：唤醒包发出后短窗确认上线，未探到上线也按成功返回「待确认」，稍后点「重新探测」确认）、`立即关机`、`重试上次动作`、
 `同步状态到云端`、`查询云端实际值`（2.2.4 起，getmsg 实时查询）。
 状态快照写在 `/var/run/cloud_control.state`（tmpfs，重启即消失），
 外部脚本可直接读这个 `key=value` 文件。
@@ -253,11 +253,11 @@ OpenWrt 官方从 25.12 起把包管理器从 **opkg 换成了 apk**，`.ipk` �
 到 [Releases](https://github.com/fox36802-ui/Openwrt-xiaomi-WOL/releases) 下载对应架构的压缩包，传到路由器安装：
 
 ```bash
-scp luci-app-cloud-control-2.2.4-x86_64.tar.gz root@192.168.1.1:/tmp/
+scp luci-app-cloud-control-2.2.5-x86_64.tar.gz root@192.168.1.1:/tmp/
 
 ssh root@192.168.1.1
 cd /tmp
-tar -xzf luci-app-cloud-control-2.2.4-x86_64.tar.gz
+tar -xzf luci-app-cloud-control-2.2.5-x86_64.tar.gz
 cd luci-app-cloud-control
 sh install.sh
 ```
@@ -294,7 +294,7 @@ tar -xzf x86_64-linux-musl-cross.tgz
 ./build.sh --toolchain "$PWD/x86_64-linux-musl-cross"
 ```
 
-产物：`luci-app-cloud-control-2.2.4-x86_64.tar.gz`。
+产物：`luci-app-cloud-control-2.2.5-x86_64.tar.gz`。
 
 > ARM 设备把工具链和 `--arch` 换成 `aarch64`：
 > `curl -LO https://musl.cc/aarch64-linux-musl-cross.tgz`，然后
@@ -551,7 +551,8 @@ tail -f /var/log/cloud_control.log
   -t cloud     测试巴法云连接（8 秒超时）
   -t cloudquery 查询巴法云主题当前保留的消息（getmsg 实时查询）
   -t status    重新探测目标机状态并写入状态文件
-  -t on        立即开机（已是开机状态则幂等跳过）
+  -t on        立即开机（已是开机状态则幂等跳过；发出唤醒包后短窗确认上线，
+               窗口内未见上线按「已发送待确认」成功返回，非失败）
   -t off       立即关机（已是关机状态则幂等跳过）
   -t retry     按状态文件记录的最后一次动作重做一次
   -t push      把当前真实状态主动上报巴法云

@@ -125,7 +125,26 @@
 #define STATE_CONFIRM_N     2           /* 状态变化需连续几次一致才提交 */
 #define STATE_PUSH_MIN_GAP  60          /* 状态变化主动上报云端的最小间隔 */
 #define STATE_RETRY_GAP     30          /* 上报失败后的补发退避间隔 */
-#define BOOT_CONFIRM_SEC    20          /* 发唤醒包后等待上线的上限 */
+/*
+ * 发唤醒包后等待上线的上限。
+ * 守护路径（小爱/云端指令）没有前端超时约束，放宽到 90 秒：
+ * 真实 Windows 冷启动普遍 20-60 秒以上，等得越久越能把「已发送待确认」
+ * 升级成「已确认上线」，云端与页面拿到的结论越实。
+ */
+#ifndef BOOT_CONFIRM_SEC
+#define BOOT_CONFIRM_SEC    90
+#endif
+/*
+ * 页面单次命令（-t on）的等待窗口：前端 fs.exec 走 rpcd/ubus，调用预算
+ * 约 30 秒。整条命令 = 初始探测 + 等待窗口 + 回读，必须整体压在 20 秒
+ * 上下（快速探测 + 15 秒窗口 ≈ 19 秒），否则拖过前端上限，XHR 直接报
+ * 「执行失败」——这正是 v2.2.4 用户「关机状态点立即开机必失败」的根因：
+ * v2.2.4 的 quick 等待 12 秒 + 双重探测回读，整链约 25-30 秒，贴着上限。
+ * 窗口内没上线也按成功返回（见 do_action 三分类），不再误判。
+ */
+#ifndef BOOT_CONFIRM_QUICK_SEC
+#define BOOT_CONFIRM_QUICK_SEC  15
+#endif
 #define ACTION_RETRY_MAX    3           /* retry_times 允许的最大值 */
 
 /* 目标机状态 */
@@ -138,8 +157,12 @@
 
 /* 防误动作 / 防死循环 */
 #define ECHO_GUARD_SEC      10          /* 自身回显去重窗口（秒） */
-#define ON_MIN_INTERVAL_SEC  10         /* on  指令最小执行间隔（秒） */
-#define OFF_MIN_INTERVAL_SEC 30         /* off 指令最小执行间隔（秒） */
+#ifndef ON_MIN_INTERVAL_SEC
+#define ON_MIN_INTERVAL_SEC  10        /* on  指令最小执行间隔（秒） */
+#endif
+#ifndef OFF_MIN_INTERVAL_SEC
+#define OFF_MIN_INTERVAL_SEC 30        /* off 指令最小执行间隔（秒） */
+#endif
 
 #ifndef CC_VERSION
 #define CC_VERSION          "dev"
@@ -218,7 +241,7 @@ static int  g_state_dirty    = 0;              /* 1 = 有状态变化待同步�
 static time_t g_state_retry_at = 0;            /* 失败退避：下次可试的最早时刻 */
 static int  g_state_wait_logged = 0;           /* 本轮待补发是否已记过「等待窗口」日志 */
 static char g_last_cmd[8]    = "";             /* 最后一次动作 on/off */
-static char g_last_result[96]= "";             /* 最后一次动作的结果 */
+static char g_last_result[160]= "";            /* 最后一次动作的结果 */
 static time_t g_last_cmd_at  = 0;
 static char g_state_detail[128] = "尚未探测";   /* 状态判定依据 */
 static char g_state_source[24]  = "init";      /* probe / action / query ... */
@@ -2347,7 +2370,7 @@ static void state_file_write(const cc_config_t *cfg)
     char updated[32];
     char cmd_at[32];
     char detail[160];
-    char result[128];
+    char result[160];
     char tmppath[256];
     FILE *fp;
 
@@ -2720,6 +2743,9 @@ static int wait_host_online(int sock, const cc_config_t *cfg, int timeout_sec)
     time_t start = time(NULL);
     time_t last_hb = start;
 
+    log_write("INFO", "等待目标机上线（最多 %d 秒，每 3 秒探测一次 SSH 端口）...",
+              timeout_sec);
+
     while ((int)(time(NULL) - start) < timeout_sec) {
         if (state_probe_once(cfg) == HOST_ON) {
             hits++;
@@ -2763,7 +2789,7 @@ static int do_action(const cc_config_t *cfg, int kind, int sock,
     int observed;
     int min_gap;
     int verify_sec = g_action_quick ? 20 : VERIFY_TIMEOUT_SEC;
-    int boot_sec = g_action_quick ? 12 : BOOT_CONFIRM_SEC;
+    int boot_sec = g_action_quick ? BOOT_CONFIRM_QUICK_SEC : BOOT_CONFIRM_SEC;
     time_t now;
     char detail[160];
     char note[96];
@@ -2779,7 +2805,17 @@ static int do_action(const cc_config_t *cfg, int kind, int sock,
     cc_strlcpy(g_last_cmd, want, sizeof(g_last_cmd));
     g_last_cmd_at = time(NULL);
 
-    observed = (known_state == HOST_UNKNOWN) ? state_probe(cfg) : known_state;
+    /*
+     * 初始探测：页面路径（quick）用单次探测省 3 秒——「不通」的二次
+     * 确认在这里没有意义，后面 wait_host_online 本来就要反复探测；
+     * 守护路径保留双重确认防抖。
+     */
+    if (known_state != HOST_UNKNOWN)
+        observed = known_state;
+    else if (g_action_quick)
+        observed = state_probe_once(cfg);
+    else
+        observed = state_probe(cfg);
 
     /* 幂等：当前已经是目标状态，重复指令不产生动作，只回报状态 */
     if (observed == target) {
@@ -2820,7 +2856,14 @@ static int do_action(const cc_config_t *cfg, int kind, int sock,
         if (kind == 1) {
             rc = do_wol(cfg, verbose);
             if (rc != 0) {
-                log_write("ERROR", "唤醒包发送失败（exit=%d）", rc);
+                /*
+                 * 真失败：唤醒包没有发出去。步骤与 exit 码写进结果
+                 * （MAC 解析错误 rc=-1、socket/发送失败 rc=-1、参数缺失
+                 * rc=-1），不再笼统地落进「动作未达预期状态」。
+                 */
+                log_write("ERROR", "唤醒包发送失败（exit=%d），唤醒包未发出", rc);
+                snprintf(g_last_result, sizeof(g_last_result),
+                         "WoL 发送失败（exit=%d，唤醒包未发出，详见日志）", rc);
                 break;
             }
             confirmed = wait_host_online(sock, cfg, boot_sec);
@@ -2840,23 +2883,48 @@ static int do_action(const cc_config_t *cfg, int kind, int sock,
         if (confirmed)
             break;
 
-        log_write("WARN", "%s 动作已下发，但状态回读未达预期", want);
+        if (kind == 1)
+            /* 窗口内没探到上线不等于失败，别用 WARN 吓人，最终结论看三分类 */
+            log_write("INFO", "唤醒包已发出，等待窗口内暂未探到上线（冷启动属正常）");
+        else
+            log_write("WARN", "%s 动作已下发，但状态回读未达预期", want);
     }
 
-    observed = state_probe(cfg);
+    /*
+     * 回读：ON 已确认时端口一定通（wait_host_online 要求连续两次探测
+     * 在线），不必再探；未确认时机器多半还关着，页面路径用单次探测
+     * （省 3 秒，整链时长压在前端预算内），守护路径保留二次确认防抖。
+     */
+    if (kind == 1 && confirmed)
+        observed = HOST_ON;
+    else if (g_action_quick)
+        observed = state_probe_once(cfg);
+    else
+        observed = state_probe(cfg);
+
     snprintf(detail, sizeof(detail), "动作 %s 后回读：目标机 SSH 端口 %s",
              want, (observed == HOST_ON) ? "可连接" : "无响应");
 
     /*
-     * WoL 是尽力而为的广播包，目标机可能要几十秒才起来；探测不到不代表
-     * 动作失败，所以仍按原语义回报 on，真实状态交给周期探测去纠偏。
-     * 关机路径则严格：只有确认离线才报 off，否则回滚成 on。
+     * WoL 结果三分类（2.2.5）：
+     *   1) 已发送 + 窗口内确认上线   -> 成功（已确认上线）；
+     *   2) 已发送 + 窗口内未见上线   -> 仍按成功返回（exit 0）。WoL 是
+     *      尽力而为的广播包，Windows 冷启动普遍 20-60 秒以上，等待窗口
+     *      内没上线不代表动作失败，绝不能报「失败」；云端按原语义回报
+     *      on，真实状态交给周期探测纠偏，页面可点「重新探测」手动确认；
+     *   3) 发送本身失败（MAC 错误 / socket 失败）-> 真失败（exit 1），
+     *      结果已在发送分支写明「唤醒包未发出」与 exit 码。
      */
     if (kind == 1 && rc == 0) {
-        cc_strlcpy(g_last_result,
-                   confirmed ? "唤醒包已发送，目标机已上线"
-                             : "唤醒包已发送，尚未检测到上线（周期探测会继续确认）",
-                   sizeof(g_last_result));
+        if (confirmed) {
+            cc_strlcpy(g_last_result, "唤醒包已发送，已确认目标机上线",
+                       sizeof(g_last_result));
+        } else {
+            snprintf(g_last_result, sizeof(g_last_result),
+                     "唤醒包已发送，目标机启动中（等待 %d 秒未见上线，"
+                     "冷启动常需更久，非失败；稍后可点「重新探测」确认）",
+                     boot_sec);
+        }
         log_write("INFO", "收到 on：%s，上报云端 on", g_last_result);
         cloud_report(cfg, "on");
         state_force(cfg, observed, "action", detail);
@@ -2872,7 +2940,13 @@ static int do_action(const cc_config_t *cfg, int kind, int sock,
         return 0;
     }
 
-    cc_strlcpy(g_last_result, "动作未达预期状态", sizeof(g_last_result));
+    /*
+     * 走到这里只剩两种情况：off 动作未达预期，或 on 的 WoL 发送失败。
+     * on 发送失败时 g_last_result 已带「哪一步、exit 几、包未发出」，
+     * 不再覆盖成笼统文案。
+     */
+    if (kind == 2)
+        cc_strlcpy(g_last_result, "动作未达预期状态", sizeof(g_last_result));
     log_write("ERROR", "收到 %s：动作未达预期状态，云端状态回报为 %s",
               want, back);
     cloud_report(cfg, back);
@@ -3680,7 +3754,8 @@ static void usage(const char *prog)
             "  -t cloud     测试巴法云连接（8 秒超时）\n"
             "  -t cloudquery 查询巴法云主题当前保留的消息（getmsg 实时查询）\n"
             "  -t status    重新探测目标机状态并写入状态文件，与云端记录不一致时同步上报\n"
-            "  -t on        立即开机（已是开机状态则幂等跳过）\n"
+            "  -t on        立即开机（已是开机状态则幂等跳过；发出唤醒包后短窗确认上线，\n"
+            "               窗口内未见上线按「已发送待确认」成功返回，非失败）\n"
             "  -t off       立即关机（已是关机状态则幂等跳过）\n"
             "  -t retry     按状态文件记录的最后一次动作重做一次\n"
             "  -t push      把当前真实状态主动上报巴法云\n"

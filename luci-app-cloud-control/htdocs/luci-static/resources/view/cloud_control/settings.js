@@ -89,6 +89,10 @@ function loadState() {
 /*
  * 执行一条命令并用弹窗展示结果。
  * 失败不抛异常，避免一次命令失败把整页交互卡住。
+ *
+ * 2.2.5：结果三分类同步到 GUI——「立即开机」在唤醒包发出但短窗内未见
+ * 上线时也返回退出码 0（CLI 输出带「启动中/待确认」字样），此时弹窗用
+ * 橙色提示「已下发，等待确认」而不是红色失败，避免把正常冷启动误读成报错。
  */
 function runAction(argv, title, reloadAfter) {
 	return fs.exec(argv[0], argv.slice(1)).then(function(res) {
@@ -100,10 +104,17 @@ function runAction(argv, title, reloadAfter) {
 		if (res && res.stderr)
 			out += res.stderr;
 
+		var pending = ok && /启动中|待确认/.test(out);
+		var color = ok ? (pending ? '#f0ad4e' : '#00a65a') : '#dd4b39';
+		var head = ok
+			? (pending ? _('唤醒包已发送，目标机启动中（已下发，等待确认）')
+			           : _('执行成功（退出码 0）'))
+			: _('执行失败（退出码 %s）').format(res ? res.code : '?');
+
 		ui.showModal(title, [
 			E('p', {
-				'style': 'margin:0 0 10px 0;font-weight:bold;color:%s'.format(ok ? '#00a65a' : '#dd4b39')
-			}, ok ? _('执行成功（退出码 0）') : _('执行失败（退出码 %s）').format(res ? res.code : '?')),
+				'style': 'margin:0 0 10px 0;font-weight:bold;color:%s'.format(color)
+			}, head),
 			E('pre', {
 				'style': 'max-height:320px;overflow:auto;margin:0;padding:8px;' +
 				         'background:rgba(128,128,128,.12);font-size:12px;' +
@@ -276,7 +287,9 @@ return view.extend({
 		};
 
 		o = s.option(form.Button, '_st_on', _('立即开机'),
-			_('先查状态：已经开机就只回报、不重复发唤醒包。'));
+			_('先查状态：已经开机就只回报、不重复发唤醒包。关机状态下发出唤醒包后，' +
+			  '会短暂等待确认上线：确认上线则提示成功；冷启动较慢（Windows 常 20-60 秒）' +
+			  '时提示「已发送待确认」，同样属于成功，稍后点「重新探测」即可确认。'));
 		o.inputtitle = _('立即开机');
 		o.inputstyle = 'apply';
 		o.onclick = function() {
