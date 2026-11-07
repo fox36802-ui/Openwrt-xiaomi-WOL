@@ -65,8 +65,30 @@
 #ifndef BEMFA_PORT
 #define BEMFA_PORT          8344
 #endif
-#define BEMFA_PUSH_URL      "https://api.bemfa.com/api/device/v1/data/3/push/get/" \
-                            "?uid=%s&topic=%s&msg=%s"
+/*
+ * HTTP 接口（2.2.4 起整体迁移到 apis.bemfa.com 现行接口）：
+ *   推送/主题校验  /va/sendMessage?uid=&topic=&type=3&msg=   （type=3 是 TCP 设备）
+ *   云端状态查询   /va/getmsg?uid=&topic=&type=3&num=1       （返回 data[0].msg）
+ * 官方文档：cloud.bemfa.com/docs/src/api_device.html
+ *
+ * 迁移结论（2026-11-07 主理人假参数实测）：
+ *   2.2.3 及更早版本使用的旧接口
+ *   api.bemfa.com/api/device/v1/data/3/push/get/ 已废弃——对任意 uid/topic
+ *   恒回 {"code":"40212","status":"topic error"}，而 40212 不在官方现行文档
+ *   错误码表（0/10002/40000/40004）中；现行 sendMessage 接口对假参数回
+ *   {"code":40004,"message":"Uid or topic err","data":null}，接口存活。
+ *   这解释了 v2.2.3 用户「UID/TOPIC 正确、TCP 设备在线、HTTP 恒 40212」。
+ *
+ * 域名允许编译期覆盖：便于本地起 fake curl 做 mock 回归测试。
+ * 注意它和 TCP 长连接的 BEMFA_HOST（bemfa.com:8344）是两回事。
+ */
+#ifndef BEMFA_API_HOST
+#define BEMFA_API_HOST      "apis.bemfa.com"
+#endif
+#define BEMFA_SENDMSG_URL   "https://" BEMFA_API_HOST \
+                            "/va/sendMessage?uid=%s&topic=%s&type=3&msg=%s"
+#define BEMFA_GETMSG_URL    "https://" BEMFA_API_HOST \
+                            "/va/getmsg?uid=%s&topic=%s&type=3&num=1"
 
 #ifndef LOG_PATH
 #define LOG_PATH            "/var/log/cloud_control.log"
@@ -181,9 +203,10 @@ static int  g_state_streak   = 0;              /* 候选连续出现次数 */
 static time_t g_state_checked= 0;              /* 上次探测时刻 */
 static time_t g_state_push_at= 0;              /* 上次成功上报云端的时刻（节流起点） */
 /*
- * g_cloud_state 是「插件本地记录的最后成功上报值」：巴法云只有 push
- * 接口，没有查询接口，这里不是向云端查回来的当前显示。状态文件里的
- * cloud_confirmed / cloud_pending 就是用来如实标注这一语义的。
+ * g_cloud_state 是「插件本地记录的最后成功上报值」：2.2.4 起虽然有了
+ * getmsg 查询接口（见 cloud_query），这个变量依然不是从云端查回来的
+ * 当前显示。需要云端实时值时走 -t cloudquery / 页面「查询云端实际值」；
+ * 状态文件里的 cloud_confirmed / cloud_pending 就是用来如实标注这一语义的。
  */
 static char g_cloud_state[8] = "";             /* 最后成功上报云端的状态 */
 static int  g_cloud_confirmed= 0;              /* cloud= 是否已确认推送成功 */
@@ -817,8 +840,9 @@ static const char *cc_home_dir(void)
 
 /*
  * json_get_code - 从巴法云的 JSON 响应里取 code 字段。
- * 响应形如 {"code":"40212","status":"topic error"} 或 {"code":0,...}。
- * 找到返回 1 并把数值写入 *code，找不到返回 0。
+ * 响应形如 {"code":40004,"message":"Uid or topic err"}（现行 sendMessage/
+ * getmsg 接口，数字）或 {"code":"40212",...}（已废弃旧接口，字符串）。
+ * 两种形态都兼容。找到返回 1 并把数值写入 *code，找不到返回 0。
  */
 static int json_get_code(const char *resp, long *code)
 {
@@ -844,6 +868,58 @@ static int json_get_code(const char *resp, long *code)
     *code = strtol(p, &end, 10);
 
     return (end != p) ? 1 : 0;
+}
+
+/*
+ * json_get_first_msg - 从 getmsg 响应里取 data[0].msg 字段的字符串值。
+ * 响应形如 {"code":0,"data":[{"msg":"on","time":"..."}],...}。
+ * 先定位 "data" 再找它后面的第一个 "msg"，避免误吃顶层 "message" 字段。
+ * 消息值固定是 on/off/status/test 这类无转义短词，不做 \" 反转义处理。
+ * 找到返回 1 并写入 out，找不到返回 0。
+ */
+static int json_get_first_msg(const char *resp, char *out, size_t outsz)
+{
+    const char *p;
+    const char *v;
+    const char *e;
+    size_t n;
+
+    if (resp == NULL || out == NULL || outsz == 0)
+        return 0;
+
+    out[0] = '\0';
+
+    p = strstr(resp, "\"data\"");
+    if (p == NULL)
+        return 0;
+
+    p = strstr(p, "\"msg\"");
+    if (p == NULL)
+        return 0;
+
+    v = p + 5;
+    while (*v == ' ' || *v == '\t')
+        v++;
+    if (*v != ':')
+        return 0;
+    v++;
+    while (*v == ' ' || *v == '\t')
+        v++;
+    if (*v != '"')
+        return 0;
+    v++;
+
+    e = strchr(v, '"');
+    if (e == NULL)
+        return 0;
+
+    n = (size_t)(e - v);
+    if (n >= outsz)
+        n = outsz - 1;
+    memcpy(out, v, n);
+    out[n] = '\0';
+
+    return 1;
 }
 
 /*
@@ -967,7 +1043,7 @@ static void cfg_trim_key(char *dst, size_t dstsz, const char *key, const char *v
     if (strcmp(t, val) != 0 && !g_cfg_trim_logged) {
         g_cfg_trim_logged = 1;
         log_write("INFO", "配置项 %s 含首尾空白字符，已自动修剪"
-                  "（巴法云按原文精确匹配主题，空白会导致 HTTP 上报 40212）",
+                  "（巴法云按原文精确匹配主题，空白会导致 HTTP 上报 40004）",
                   key);
     }
 
@@ -1154,6 +1230,14 @@ static int cfg_load(cc_config_t *cfg)
 /*
  * 向巴法云推送设备状态（on / off），返回 0 表示确认送达。
  *
+ * 2.2.4 接口迁移：改用现行接口 apis.bemfa.com/va/sendMessage
+ * （uid/topic 经 url_encode，msg 固定为 on/off/status，无需编码）。
+ * 旧接口 api.bemfa.com/api/device/v1/data/3/push/get/ 已废弃——
+ * 2026-11-07 用假参数实测，对任意参数恒回 40212「topic error」
+ * （该码不在官方现行文档错误码表中），这正是 v2.2.3 用户
+ * 「UID/TOPIC 正确、TCP 设备在线、HTTP 恒 40212」的根因；
+ * 现行接口对假参数回 40004，接口存活。
+ *
  * 2.2.3 评估结论：为什么继续用 HTTP push，不改走 TCP 长连接发布。
  *   守护进程确实常驻 bemfa.com:8344 连接，理论上可以直接发
  *   cmd=2&uid=..&topic=..&msg=on 发布状态（注意是 cmd=2 不是 cmd=3，
@@ -1165,8 +1249,8 @@ static int cfg_load(cc_config_t *cfg)
  *      语义上等于把上报通道的命运绑在指令处理逻辑上；
  *   b) 发布成功≠主题正确：TCP 发布对不存在的主题会静默自动建主题并
  *      回 res=1，配置填错（含空白、大小写）时不会像 HTTP 那样报
- *      40212，而是悄悄建一个错名主题——小爱读的是真主题，状态永远
- *      同步不到用户实际使用的主题上，且用户毫无感知。HTTP 的 40212
+ *      40004，而是悄悄建一个错名主题——小爱读的是真主题，状态永远
+ *      同步不到用户实际使用的主题上，且用户毫无感知。HTTP 的 40004
  *      是宝贵的配置纠错信号，不应绕过；
  *   c) 确认语义弱：cmd=2&res=1 只表示服务器收到了，需在单线程
  *      select 循环里区分「发布回执」与「业务报文」并做超时兜底，
@@ -1176,7 +1260,7 @@ static int cfg_load(cc_config_t *cfg)
  *      TCP 长连接；改走 TCP 意味着短命进程也要连/订/发/断，与守护
  *      进程的双连接并发。
  *   保留 HTTP：curl 独立进程、天然带 HTTP 状态码 + 业务码双重校验、
- *   40212 可明确诊断配置错误；断网时由 cloud_report 的 30 秒退避补发。
+ *   40004 可明确诊断配置错误；断网时由 cloud_report 的 30 秒退避补发。
  */
 /* 最近一次推送失败的可读原因，供 -t push 等调用方透传给页面 */
 static char g_push_fail_reason[192] = "";
@@ -1204,7 +1288,7 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
     url_encode(cfg->client_id, uid_enc, sizeof(uid_enc));
     url_encode(cfg->topic, topic_enc, sizeof(topic_enc));
 
-    snprintf(url, sizeof(url), BEMFA_PUSH_URL, uid_enc, topic_enc, msg);
+    snprintf(url, sizeof(url), BEMFA_SENDMSG_URL, uid_enc, topic_enc, msg);
 
     /* curl 参数全部为常量，URL 已做百分号编码，无 shell 参与 */
     if (find_bin("curl", curl_bin, sizeof(curl_bin)) != 0) {
@@ -1230,8 +1314,8 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
     }
 
     /*
-     * 2.2.2：HTTP 200 不等于业务成功。主题填错等情况下巴法云会返回
-     * HTTP 200 + {"code":"40212","status":"topic error"}，curl -f 拦不住，
+     * 2.2.2：HTTP 200 不等于业务成功。参数填错等情况下现行接口会返回
+     * HTTP 200 + {"code":40004,"message":"Uid or topic err"}，curl -f 拦不住，
      * 旧版会把这种失败记成「已确认上报」——页面显示云端已开机，
      * 巴法云的 msg 却从没变过。这里复用 json_get_code 解析业务码：
      * code!=0 按失败处理（返回 -1，由 cloud_report 置待同步标记补发）；
@@ -1243,28 +1327,33 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
 
             redact_secrets(resp, safe, sizeof(safe));
 
-            if (code == 40212) {
+            if (code == 40004) {
                 cc_strlcpy(g_push_fail_reason,
-                           "巴法云返回 40212（主题不存在或与私钥不匹配，见日志指引）",
+                           "巴法云返回 40004（UID 或主题错误，见日志指引）",
                            sizeof(g_push_fail_reason));
                 /*
-                 * 2.2.3：40212 = 主题不存在/与私钥不匹配，给出针对性指引。
-                 * 典型坑：TCP 订阅显示在线但 HTTP 上报 40212 —— 巴法云
-                 * TCP 侧对主题做了容错，HTTP 侧按原文精确匹配；主题带
-                 * 首尾空格（配置引号内空格）时 URL 编码成 %20 后必查无
-                 * 此主题。2.2.3 起配置已自动修剪，老配置重启后生效。
+                 * 2.2.4：40004 = UID 或主题错误，给出针对性指引。
+                 * 典型坑：TCP 订阅显示在线但 HTTP 上报 40004 —— 巴法云
+                 * TCP 侧对主题做了容错（甚至静默自动建主题），HTTP 侧
+                 * 按原文精确匹配；主题带首尾空格（配置引号内空格）时
+                 * URL 编码成 %20 后必查无此主题。2.2.3 起配置已自动修剪，
+                 * 老配置重启后生效。
+                 * 另注：2.2.3 及更早版本报的是 40212，那是已废弃旧接口
+                 * （api.bemfa.com/.../push/get/，2026-11-07 实测对任意
+                 * 参数恒回 40212）的响应码，与现行接口的 40004 不是一回事。
                  */
                 log_write("ERROR",
-                          "云端上报 msg=%s 被巴法云拒绝（40212 主题不存在）：%s\n"
-                          "  排查指引：1) 到巴法云控制台逐字符核对主题名，"
-                          "区分大小写、排查首尾空格（本版起配置已自动修剪，"
+                          "云端上报 msg=%s 被巴法云拒绝（40004 UID 或主题错误）：%s\n"
+                          "  排查指引：1) 核对 Client ID 是否为控制台「私钥」里的"
+                          "32 位 UID（不是登录账号）；\n"
+                          "  2) 到巴法云控制台逐字符核对主题名，"
+                          "区分大小写、排查首尾空格（2.2.3 起配置已自动修剪，"
                           "重启服务后生效）；\n"
-                          "  2) 确认该主题确实建在这个 UID（私钥）下；\n"
-                          "  3) TCP 订阅能上线不代表 HTTP 接口可用——"
-                          "TCP 侧容错处理了空白/容错匹配，HTTP 按 URL 编码"
-                          "后的原文精确查找；\n"
-                          "  4) 若主题是设备首次 TCP 订阅时自动创建的，"
-                          "控制台里手动重名的主题可能属于其它 UID。",
+                          "  3) 确认该主题确实建在这个 UID 下；\n"
+                          "  4) TCP 订阅能上线不代表主题配置正确——"
+                          "TCP 侧容错甚至静默自动建主题，HTTP 按原文精确查找；\n"
+                          "  5) 若日志出现的是 40212，那是 2.2.3 及更早版本旧接口"
+                          "的响应码，请先升级到本版。",
                           msg, safe);
             } else {
                 snprintf(g_push_fail_reason, sizeof(g_push_fail_reason),
@@ -1285,6 +1374,115 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
     cc_strlcpy(g_last_push_msg, msg, sizeof(g_last_push_msg));
     g_last_push_time = time(NULL);
     g_push_fail_reason[0] = '\0';
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 巴法云云端状态查询（getmsg）                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * cloud_query - 用现行 getmsg 接口查询主题上当前保留的最新一条消息。
+ *
+ * 2.2.4 修订：2.2.1~2.2.3 文档里「巴法云只有上报接口，没有查询接口」
+ * 的结论针对的是已废弃的旧 push 接口体系；现行 apis.bemfa.com 体系带
+ * 查询接口：
+ *   GET https://apis.bemfa.com/va/getmsg?uid=&topic=&type=3&num=1
+ * 返回形如 {"code":0,"data":[{"msg":"on","time":"..."}],...}，
+ * 这里取 data[0].msg（解析见 json_get_first_msg）。
+ *
+ * 用途：
+ *   - `-t cloudquery` 命令行：把云端实际值显示给管理员（页面
+ *     「查询云端实际值」按钮同样走这条路径）；
+ *   - 守护进程收到 msg=status 时先查云端当前值与本地探测值对比留痕
+ *     （上报行为与幂等语义不变）。
+ *
+ * 返回 0 表示查询成功且 out 里是云端消息（on/off/status/test 等）；
+ * -1 curl 缺失 / 网络失败 / 参数未配置；-2 业务码非 0；-3 响应解析不到消息。
+ */
+static char g_query_fail_reason[192] = "";
+
+static int cloud_query(const cc_config_t *cfg, char *out, size_t outsz)
+{
+    char uid_enc[384];
+    char topic_enc[384];
+    char url[1024];
+    char resp[2048];
+    char *argv[8];
+    char curl_bin[256];
+    long code = -1;
+    int rc;
+
+    if (cfg == NULL || out == NULL || outsz == 0)
+        return -1;
+
+    out[0] = '\0';
+
+    if (cfg->client_id[0] == '\0' || cfg->topic[0] == '\0') {
+        cc_strlcpy(g_query_fail_reason, "未配置 Client ID 或主题",
+                   sizeof(g_query_fail_reason));
+        log_write("WARN", "未配置 Client ID 或主题，跳过云端状态查询");
+        return -1;
+    }
+
+    url_encode(cfg->client_id, uid_enc, sizeof(uid_enc));
+    url_encode(cfg->topic, topic_enc, sizeof(topic_enc));
+
+    snprintf(url, sizeof(url), BEMFA_GETMSG_URL, uid_enc, topic_enc);
+
+    /* 与 bemfa_push 相同的无 shell 约束：curl 参数全部为常量 */
+    if (find_bin("curl", curl_bin, sizeof(curl_bin)) != 0) {
+        cc_strlcpy(g_query_fail_reason, "未安装 curl", sizeof(g_query_fail_reason));
+        log_write("WARN", "未安装 curl，无法查询云端状态");
+        return -1;
+    }
+
+    argv[0] = curl_bin;
+    argv[1] = (char *)"-s";
+    argv[2] = (char *)"-f";
+    argv[3] = (char *)"--max-time";
+    argv[4] = (char *)"8";
+    argv[5] = url;
+    argv[6] = NULL;
+
+    rc = run_argv_capture(argv, NULL, NULL, 15, resp, sizeof(resp));
+    if (rc != 0) {
+        snprintf(g_query_fail_reason, sizeof(g_query_fail_reason),
+                 "curl 执行失败（exit=%d，网络或 DNS 异常）", rc);
+        log_write("WARN", "云端状态查询失败（curl exit=%d）", rc);
+        return -1;
+    }
+
+    if (json_get_code(resp, &code) && code != 0) {
+        char safe[1024];
+
+        redact_secrets(resp, safe, sizeof(safe));
+
+        if (code == 40004)
+            cc_strlcpy(g_query_fail_reason,
+                       "巴法云返回 40004（UID 或主题错误，核对 Client ID 与主题名）",
+                       sizeof(g_query_fail_reason));
+        else
+            snprintf(g_query_fail_reason, sizeof(g_query_fail_reason),
+                     "巴法云返回业务码 %ld（详见日志）", code);
+
+        log_write("WARN", "云端状态查询被巴法云拒绝（code=%ld）：%s", code, safe);
+        return -2;
+    }
+
+    if (!json_get_first_msg(resp, out, outsz) || out[0] == '\0') {
+        char safe[1024];
+
+        redact_secrets(resp, safe, sizeof(safe));
+        cc_strlcpy(g_query_fail_reason,
+                   "响应里解析不到消息（可能该主题下还没有任何消息）",
+                   sizeof(g_query_fail_reason));
+        log_write("WARN", "getmsg 响应解析不到 data[0].msg：%s", safe);
+        return -3;
+    }
+
+    g_query_fail_reason[0] = '\0';
 
     return 0;
 }
@@ -2257,12 +2455,14 @@ static int state_cloud_differs(void)
 /*
  * cloud_report - 上报云端并记录「插件最后成功推了什么」。
  *
- * 语义澄清：巴法云只有上报（push）接口，没有查询接口。g_cloud_state 是
- * 插件本地记录的「最后成功上报值」，不是向云端查询到的当前显示；状态文件
- * 里的 cloud_confirmed / cloud_pending 如实标注这一点。
+ * 语义澄清（2.2.4 修订）：2.2.1~2.2.3 说的「巴法云只有上报（push）接口，
+ * 没有查询接口」针对的是已废弃的旧接口体系；2.2.4 起现行 apis.bemfa.com
+ * 提供 getmsg 查询（见 cloud_query）。g_cloud_state 仍然是插件本地记录的
+ * 「最后成功上报值」，不是向云端查询到的当前显示；页面需要云端实时值时
+ * 走「查询云端实际值」（-t cloudquery），不拿本地记录冒充。
  *
  * 成功：记录已确认值、刷新 60 秒节流起点、清掉待补发标记。
- * 失败：curl 缺失 / 网络抖动 / 主题错误时不再「丢弃这次同步」，而是置
+ * 失败：curl 缺失 / 网络抖动 / 参数错误时不再「丢弃这次同步」，而是置
  *       g_state_dirty 并设 30 秒退避，由 state_sync_pending 后续补齐。
  *       仅当允许主动同步时才置标记，保证 state_sync=0 不产生主动上报。
  */
@@ -2694,6 +2894,9 @@ static void handle_cmd(const cc_config_t *cfg, int kind, int sock)
 
     /* 云端主动查询：往主题发 msg=status，插件回推当前真实状态 */
     if (kind == CMD_QUERY) {
+        char cmsg[64] = "";
+        int cloud_known;
+
         now = time(NULL);
 
         /* 状态太旧就重新探一次，否则直接用缓存，避免每次查询都等 2 秒 */
@@ -2711,6 +2914,31 @@ static void handle_cmd(const cc_config_t *cfg, int kind, int sock)
                    ((st == HOST_OFF) ? "off" :
                     (g_cloud_state[0] ? g_cloud_state : "off"));
         log_write("INFO", "收到状态查询，回推当前状态 %s", push_msg);
+
+        /*
+         * 2.2.4：回推前先用 getmsg 查一次云端当前保留的消息，与本地探测值
+         * 对比留痕——「云端显示」从此有了真实的读数，不再是只能以控制台
+         * 页面为准的盲区。上报行为保持不变：无论云端当前是什么值都回推
+         * 本地真实状态（幂等：云端值与本地一致时重复推送无副作用）。
+         */
+        cloud_known = cloud_query(cfg, cmsg, sizeof(cmsg));
+        if (cloud_known == 0) {
+            if (strcmp(cmsg, push_msg) == 0)
+                log_write("INFO",
+                          "云端查询（getmsg）：%s，与本地探测一致，回推确认 %s",
+                          cmsg, push_msg);
+            else
+                log_write("INFO",
+                          "云端查询（getmsg）：%s，与本地探测 %s 不一致，"
+                          "回推本地真实状态纠偏",
+                          cmsg, push_msg);
+        } else {
+            log_write("WARN",
+                      "云端查询失败（%s），按本地探测值 %s 直接回推",
+                      g_query_fail_reason[0] ? g_query_fail_reason : "未知原因",
+                      push_msg);
+        }
+
         cloud_report(cfg, push_msg);
         return;
     }
@@ -3261,10 +3489,15 @@ static int daemonize(void)
  * 为什么必须做这一步（实测结论）：
  *   TCP 订阅接口对任何 uid/topic 都返回 "cmd=1&res=0"，
  *   连随便编的 UID 和主题都能过 —— 它只证明「服务器连得上」，
- *   证明不了主题填对了。HTTP 接口才会真正校验：
- *   主题不存在时返回 {"code":"40212","status":"topic error"}。
+ *   证明不了主题填对了。HTTP 接口才会真正校验：参数错误时
+ *   返回 {"code":40004,"message":"Uid or topic err"}。
  *
- * 推送内容固定用 "test"：守护进程只认 on/off，不会误触发开关机。
+ * 2.2.4 接口迁移：旧接口 api.bemfa.com/api/device/v1/data/3/push/get/
+ *   已废弃（2026-11-07 假参数实测对任意参数恒回 40212，该码不在官方
+ *   现行文档错误码表中），本函数与 bemfa_push 一并切换到现行接口
+ *   apis.bemfa.com/va/sendMessage。2.2.3 的 40212 专项提示随之退役。
+ *
+ * 推送内容固定用 "test"：守护进程只认 on/off/status，不会误触发开关机。
  *
  * 返回：0 校验通过 / 1 校验失败 / 2 无法校验（没装 curl 等）
  */
@@ -3285,7 +3518,7 @@ static int bemfa_check_topic(const cc_config_t *cfg)
     url_encode(cfg->client_id, uid_enc, sizeof(uid_enc));
     url_encode(cfg->topic, topic_enc, sizeof(topic_enc));
 
-    snprintf(url, sizeof(url), BEMFA_PUSH_URL, uid_enc, topic_enc, "test");
+    snprintf(url, sizeof(url), BEMFA_SENDMSG_URL, uid_enc, topic_enc, "test");
 
     if (find_bin("curl", curl_bin, sizeof(curl_bin)) != 0) {
         log_write("WARN", "未安装 curl，跳过主题有效性校验");
@@ -3321,16 +3554,19 @@ static int bemfa_check_topic(const cc_config_t *cfg)
 
         redact_secrets(resp, safe, sizeof(safe));
 
-        if (code == 40212) {
-            /* 2.2.3：与 bemfa_push 的 40212 提示保持同一口径 */
+        if (code == 40004) {
+            /* 2.2.4：与 bemfa_push 的 40004 提示保持同一口径 */
             log_write("ERROR",
-                      "巴法云拒绝了这个主题（40212 主题不存在）：%s\n"
-                      "  排查指引：1) 到巴法云控制台逐字符核对主题名，"
-                      "区分大小写、排查首尾空格（本版起配置已自动修剪，"
-                      "重新保存配置后生效）；\n"
-                      "  2) 确认该主题确实建在这个 UID（私钥）下；\n"
-                      "  3) TCP 订阅能上线不代表主题与 HTTP 接口一致"
-                      "——TCP 侧有容错匹配，HTTP 按原文精确查找。",
+                      "巴法云拒绝了这个主题（40004 UID 或主题错误）：%s\n"
+                      "  排查指引：1) 核对 Client ID 是否为控制台「私钥」里的"
+                      "32 位 UID（不是登录账号）；\n"
+                      "  2) 逐字符核对主题名，区分大小写、排查首尾空格"
+                      "（2.2.3 起配置已自动修剪，重新保存配置后生效）；\n"
+                      "  3) 确认该主题确实建在这个 UID 下；\n"
+                      "  4) 旧接口 api.bemfa.com/api/device/v1/data/3/push/get/"
+                      "已废弃（2026-11-07 实测对任意参数恒回 40212），"
+                      "本版起走 apis.bemfa.com/va/sendMessage，"
+                      "40004 即 UID 或主题参数本身有误。",
                       safe);
         } else {
             log_write("ERROR", "巴法云拒绝了这个主题：code=%ld，返回：%s", code, safe);
@@ -3442,6 +3678,7 @@ static void usage(const char *prog)
             "  -t wol       执行一次 Wake-on-LAN 测试\n"
             "  -t ssh       执行一次 SSH 关机测试\n"
             "  -t cloud     测试巴法云连接（8 秒超时）\n"
+            "  -t cloudquery 查询巴法云主题当前保留的消息（getmsg 实时查询）\n"
             "  -t status    重新探测目标机状态并写入状态文件，与云端记录不一致时同步上报\n"
             "  -t on        立即开机（已是开机状态则幂等跳过）\n"
             "  -t off       立即关机（已是关机状态则幂等跳过）\n"
@@ -3621,7 +3858,8 @@ int main(int argc, char **argv)
             } else if (g_cloud_confirmed &&
                        strcmp(g_cloud_state, state_name(st)) == 0) {
                 fprintf(stdout,
-                        "云端同步：已上报 %s（推送成功时的本地记录，非云端实时查询）\n",
+                        "云端同步：已上报 %s（推送成功时的本地记录，非云端实时查询）\n"
+                        "          如需云端实际值，可执行 cloud_control -t cloudquery\n",
                         g_cloud_state);
             } else if (g_state_dirty) {
                 fprintf(stdout,
@@ -3678,19 +3916,46 @@ int main(int argc, char **argv)
             if (rc == 0) {
                 fprintf(stdout,
                         "结果：成功 - 已把当前状态 %s 上报巴法云（curl 退出码 0）\n"
-                        "说明：巴法云只有上报接口，这里是「推送成功」的本地记录，"
-                        "不是向云端查询到的当前显示。\n",
+                        "说明：这里显示的是「推送成功」，如需核对云端实际保留的值，\n"
+                        "可执行 cloud_control -t cloudquery（apis.bemfa.com getmsg 实时查询）。\n",
                         msg);
             } else {
                 fprintf(stdout,
                         "结果：失败 - 当前状态 %s 未能上报巴法云（%s）\n"
-                        "说明：云端显示可能仍是旧值。请检查 curl / 网络 / 主题名；"
-                        "若日志出现 40212，请到巴法云控制台逐字符核对主题名"
-                        "（区分大小写、排查首尾空格，确认主题建在本 UID 下）；"
+                        "说明：云端显示可能仍是旧值，可用 cloud_control -t cloudquery\n"
+                        "实时查询云端当前保留的消息。若报 40004（UID 或主题错误）：\n"
+                        "请到巴法云控制台逐字符核对主题名（区分大小写、排查首尾空格，\n"
+                        "确认主题建在本 UID 下）。2.2.3 及更早版本的 40212 来自已废弃\n"
+                        "的旧接口 api.bemfa.com，与本版使用的现行 sendMessage 接口无关。\n"
                         "也可往主题发 msg=status 让守护进程回推真实状态，"
                         "或开启「周期同步状态」由守护进程在状态变化时自动补发。\n",
                         msg,
                         g_push_fail_reason[0] ? g_push_fail_reason : "未知原因");
+            }
+
+        } else if (strcmp(test_mode, "cloudquery") == 0) {
+            char cmsg[64];
+
+            if (cfg.client_id[0] == '\0' || cfg.topic[0] == '\0') {
+                fprintf(stdout, "结果：失败 - 未配置 Client ID 或主题\n");
+                return 1;
+            }
+
+            rc = cloud_query(&cfg, cmsg, sizeof(cmsg));
+            if (rc == 0) {
+                fprintf(stdout,
+                        "结果：成功 - 云端当前保留的消息：%s\n"
+                        "说明：这是通过 apis.bemfa.com getmsg 接口实时查询到的值，\n"
+                        "即主题上最后一次被写入的消息（on/off/status 均有可能），\n"
+                        "不是本地状态文件的记录。\n",
+                        cmsg);
+            } else {
+                fprintf(stdout,
+                        "结果：失败 - 云端状态查询未成功（%s）\n"
+                        "说明：检查 curl 与网络；报 40004 时核对 Client ID 与主题名\n"
+                        "（区分大小写、排查首尾空格，确认主题建在本 UID 下）；\n"
+                        "解析不到消息时，往主题发一条 msg=on 或 msg=off 后再查。\n",
+                        g_query_fail_reason[0] ? g_query_fail_reason : "未知原因");
             }
 
         } else {

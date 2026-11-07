@@ -201,7 +201,8 @@ return view.extend({
 	                  '随后若与云端记录不一致，会在 60 秒同步窗口过后自动补发，上报失败则每 30 秒重试。' +
 	                  '断网、配置不全或服务未启用时，本地探测与页面状态仍会照常更新（只是不上报云端）。' +
 	                  '「重新探测」同样会在状态与云端记录不一致时自动推送。' +
-	                  '另外可以在巴法云控制台往本主题发 msg=status，插件会把当前状态回推到云端。');
+	                  '另外可以在巴法云控制台往本主题发 msg=status，插件会把当前状态回推到云端；' +
+	                  '2.2.4 起还可点「查询云端实际值」，通过 getmsg 接口实时查询云端保留的消息。');
 
 		o = s.option(form.DummyValue, '_host_state', _('目标机当前状态'));
 		o.cfgvalue = function() {
@@ -234,8 +235,9 @@ return view.extend({
 			var st = RT.state;
 			var cmd = st.last_cmd && st.last_cmd !== '-' ? st.last_cmd : '-';
 			var cloud = st.cloud || 'unknown';
-			/* cloud= 只是插件本地记录的「最后成功上报值」，巴法云没有查询接口，
-			   不能假装在向云端查询。如实标注，未确认过就直说尚未成功上报。 */
+			/* cloud= 只是插件本地记录的「最后成功上报值」。2.2.4 起巴法云
+			   现行接口体系带 getmsg 查询接口，点下方「查询云端实际值」可
+			   实时查询云端保留的消息；本地记录不冒充云端实时值。 */
 			var confirmed = (st.cloud_confirmed === '1');
 			var pending = (st.cloud_pending === '1');
 			var cloudLabel = (cloud === 'on') ? _('开机') :
@@ -245,7 +247,7 @@ return view.extend({
 			if (!confirmed || cloud === 'unknown')
 				cloudText = _('尚未成功推送到云端（本地记录，未向云端查询）');
 			else
-				cloudText = _('已确认推送到云端：%s（推送成功时的本地记录，非云端实时查询）').format(cloudLabel);
+				cloudText = _('已确认推送到云端：%s（推送成功时的本地记录；如需云端实际值，点「查询云端实际值」）').format(cloudLabel);
 
 			if (pending)
 				cloudText += _(' ｜ 有新状态待同步，插件会自动补发');
@@ -299,13 +301,24 @@ return view.extend({
 
 		o = s.option(form.Button, '_st_push', _('同步状态到云端'),
 			_('把当前探测到的真实状态主动推给巴法云，用于纠正云端显示不一致。' +
-			  '弹窗会明确显示推送成功或失败；巴法云只有上报接口，插件不会去查询云端当前显示。' +
-			  '若失败提示 40212（主题不存在）：主题名与巴法云控制台不一致、主题没建在这个私钥下，' +
-			  '或主题带首尾空格（TCP 订阅能容错但 HTTP 上报不能）——请逐字符核对主题名。'));
+			  '弹窗会明确显示推送成功或失败。2.2.4 起走现行 sendMessage 接口（apis.bemfa.com），' +
+			  '旧接口 api.bemfa.com push/get 已废弃（2026-11-07 实测对任意参数恒回 40212）。' +
+			  '若失败提示 40004（UID 或主题错误）：主题名与巴法云控制台不一致、主题没建在这个私钥下，' +
+			  '或主题带首尾空格——请逐字符核对主题名。如需先看云端当前值，用「查询云端实际值」。'));
 		o.inputtitle = _('同步');
 		o.inputstyle = 'action';
 		o.onclick = function() {
 			return runAction([ DAEMON, '-t', 'push' ], _('同步状态到云端'), true);
+		};
+
+		o = s.option(form.Button, '_st_cloudquery', _('查询云端实际值'),
+			_('2.2.4 起：通过巴法云现行 getmsg 接口（apis.bemfa.com/va/getmsg）实时查询' +
+			  '主题上当前保留的最新消息，这是真正的云端查询，不是本地记录。' +
+			  '用于核对「插件本地记录」与「云端显示」是否一致；报 40004 时核对 Client ID 与主题名。'));
+		o.inputtitle = _('查询云端');
+		o.inputstyle = 'action';
+		o.onclick = function() {
+			return runAction([ DAEMON, '-t', 'cloudquery' ], _('查询云端实际值'), false);
 		};
 
 		/* ============================================================
@@ -329,7 +342,7 @@ return view.extend({
 			_('巴法云控制台里给该设备设置的主题名，默认 PC001。' +
 			  '小爱 / 米家场景通过这个名字下发 on 或 off。' +
 			  '注意：主题名区分大小写，首尾不能有空格——空格在 TCP 订阅时被巴法云容错，' +
-			  '但 HTTP 上报会报 40212（主题不存在）；本版起保存配置时会自动修剪空白。'));
+			  '但 HTTP 接口会报 40004（UID 或主题错误）；本版起保存配置时会自动修剪空白。'));
 		o.placeholder = 'PC001';
 		o.default = 'PC001';
 		o.rmempty = true;
@@ -457,8 +470,9 @@ return view.extend({
 		s.description = _('测试读取的是已保存的配置，改完参数请先「保存并应用」再测。' +
 		                  '「测试巴法云连接」除了连服务器，还会用 HTTP 接口校验主题是否真的存在' +
 		                  '——TCP 订阅对任何主题都返回成功，光看它靠不住。' +
-		                  '校验报 40212（主题不存在）时：逐字符核对主题名（区分大小写、' +
+		                  '校验报 40004（UID 或主题错误）时：逐字符核对主题名（区分大小写、' +
 		                  '排查首尾空格），并确认主题确实建在这个 Client ID 下。' +
+		                  '2.2.3 及更早版本报的 40212 来自已废弃的旧接口，与本版无关。' +
 		                  '注意：「测试 SSH 关机」会真的让目标机关机。');
 
 		o = s.option(form.Button, '_test_wol', _('测试开机封包'));

@@ -3,6 +3,39 @@
 本项目的所有重要变更都记录在这里。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.4] - 2026-11-07
+
+### 修复：HTTP 上报恒报 40212「topic error」——旧推送接口已废弃，整体迁移到现行 sendMessage 接口
+
+- **根因：接口废弃，不是配置错误。** v2.2.3 用户实测 UID/TOPIC 确认正确、
+  TCP 设备在线，但「同步状态到云端」恒报 40212。主理人 2026-11-07 用假
+  参数实测定性：插件一直调用的旧接口
+  `api.bemfa.com/api/device/v1/data/3/push/get/` 已废弃——对任意参数恒回
+  `{"code":"40212","status":"topic error"}`，而 40212 不在官方现行文档错误
+  码表（0/10002/40000/40004）中；现行接口
+  `apis.bemfa.com/va/sendMessage?uid=&topic=&type=3&msg=` 对假参数回
+  `{"code":40004,"message":"Uid or topic err","data":null}`，接口存活。
+  官方文档：cloud.bemfa.com/docs/src/api_device.html。
+- **`bemfa_push` / `bemfa_check_topic` 切换新接口。** 业务码校验改为
+  `code==0` 成功；40004（UID 或主题错误）给出专项指引（核对 32 位私钥
+  UID、逐字符核对主题名、确认主题建在本 UID 下）；其它码通用失败。
+  2.2.3 的 40212 专项提示随之退役——那个码只属于已废弃的旧接口。
+- **新增云端状态查询 `cloud_query`（getmsg）。** 现行接口体系带查询接口
+  `apis.bemfa.com/va/getmsg?uid=&topic=&type=3&num=1`，返回 `data[0].msg`。
+  新增 `-t cloudquery` 命令行（页面新增「查询云端实际值」按钮同走此路）；
+  守护进程收到 msg=status 时，回推前先 getmsg 查云端当前值与本地探测值
+  对比留痕再上报（上报行为与幂等语义不变）。2.2.1~2.2.3「巴法云没有
+  查询接口」的结论只针对旧接口体系，相关文案全部修订。
+- **文案同步：** 40212 语义全面替换为 40004（UID 或主题错误）+ 旧接口
+  废弃说明与实测日期；README / README-dist / 设置页（Topic 输入框、
+  「同步状态到云端」、「连通性测试」）同步更新。
+
+### 变更
+
+- 版本号 2.2.3 → 2.2.4。
+- 新增 `BEMFA_API_HOST` 编译期覆盖（`#ifndef`，HTTP 接口域名，与 TCP 侧
+  `BEMFA_HOST` / `BEMFA_PORT` 是两回事），便于本地 mock 回归。
+
 ## [2.2.3] - 2026-11-07
 
 ### 修复：TCP 订阅在线但 HTTP 上报 40212「topic error」——配置项首尾空白自动修剪
