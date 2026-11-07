@@ -97,6 +97,7 @@
 #define STATE_PROBE_SEC     2           /* 单次 SSH 端口探测超时 */
 #define STATE_CONFIRM_N     2           /* 状态变化需连续几次一致才提交 */
 #define STATE_PUSH_MIN_GAP  60          /* 状态变化主动上报云端的最小间隔 */
+#define STATE_RETRY_GAP     30          /* 上报失败后的补发退避间隔 */
 #define BOOT_CONFIRM_SEC    20          /* 发唤醒包后等待上线的上限 */
 #define ACTION_RETRY_MAX    3           /* retry_times 允许的最大值 */
 
@@ -173,8 +174,21 @@ static int  g_host_state     = HOST_UNKNOWN;   /* 已提交的状态 */
 static int  g_state_candidate= HOST_UNKNOWN;   /* 待确认的候选状态 */
 static int  g_state_streak   = 0;              /* 候选连续出现次数 */
 static time_t g_state_checked= 0;              /* 上次探测时刻 */
-static time_t g_state_push_at= 0;              /* 上次主动同步云端的时刻 */
+static time_t g_state_push_at= 0;              /* 上次成功上报云端的时刻（节流起点） */
+/*
+ * g_cloud_state 是「插件本地记录的最后成功上报值」：巴法云只有 push
+ * 接口，没有查询接口，这里不是向云端查回来的当前显示。状态文件里的
+ * cloud_confirmed / cloud_pending 就是用来如实标注这一语义的。
+ */
 static char g_cloud_state[8] = "";             /* 最后成功上报云端的状态 */
+static int  g_cloud_confirmed= 0;              /* cloud= 是否已确认推送成功 */
+/*
+ * 状态同步「欠账」：状态变化被 60 秒节流拦下、或 cloud_report 失败时置 1，
+ * 由每轮周期检查里的 state_sync_pending 在窗口/退避到期后补齐，不再丢弃。
+ */
+static int  g_state_dirty    = 0;              /* 1 = 有状态变化待同步到云端 */
+static time_t g_state_retry_at = 0;            /* 失败退避：下次可试的最早时刻 */
+static int  g_state_wait_logged = 0;           /* 本轮待补发是否已记过「等待窗口」日志 */
 static char g_last_cmd[8]    = "";             /* 最后一次动作 on/off */
 static char g_last_result[96]= "";             /* 最后一次动作的结果 */
 static time_t g_last_cmd_at  = 0;
@@ -2026,6 +2040,47 @@ static void state_flatten(char *s)
 }
 
 /*
+ * state_file_restore_cloud - 进程启动时读回上一次的「本地云端记录」。
+ *
+ * 状态文件由守护进程和 -t 单次命令共享。若不读回，页面点一次「重新探测」
+ * 就会开一个新进程、把 cloud= 清成「尚未成功上报」，守护进程重启同理。
+ * 读不到就保持全零（如实表示未知），绝不假装已经上报成功。
+ */
+static void state_file_restore_cloud(void)
+{
+    char line[256];
+    FILE *fp = fopen(STATE_PATH, "r");
+
+    if (fp == NULL)
+        return;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *v;
+        char *e;
+
+        if (strncmp(line, "cloud=", 6) == 0) {
+            v = line + 6;
+            e = strchr(v, '\n');
+            if (e != NULL)
+                *e = '\0';
+            e = strchr(v, '\r');
+            if (e != NULL)
+                *e = '\0';
+            if (strcmp(v, "on") == 0 || strcmp(v, "off") == 0)
+                cc_strlcpy(g_cloud_state, v, sizeof(g_cloud_state));
+        } else if (strncmp(line, "cloud_confirmed=", 16) == 0) {
+            v = line + 16;
+            g_cloud_confirmed = (atoi(v) == 1) ? 1 : 0;
+        } else if (strncmp(line, "cloud_pending=", 14) == 0) {
+            v = line + 14;
+            g_state_dirty = (atoi(v) == 1) ? 1 : 0;
+        }
+    }
+
+    fclose(fp);
+}
+
+/*
  * state_file_write - 把当前状态原子写入状态文件，供 LuCI 页面和脚本查询。
  * 先写 .tmp 再 rename，避免读取方看到写了一半的内容。
  */
@@ -2062,12 +2117,16 @@ static void state_file_write(const cc_config_t *cfg)
             "last_cmd_at=%s\n"
             "last_result=%s\n"
             "cloud=%s\n"
+            "cloud_confirmed=%d\n"
+            "cloud_pending=%d\n"
             "pid=%d\n"
             "version=%s\n",
             state_name(g_host_state), updated, g_state_source, detail,
             g_last_cmd[0] ? g_last_cmd : "-", cmd_at,
             result[0] ? result : "-",
             g_cloud_state[0] ? g_cloud_state : "unknown",
+            g_cloud_confirmed ? 1 : 0,
+            g_state_dirty ? 1 : 0,
             (int)getpid(), CC_VERSION);
 
     fclose(fp);
@@ -2107,15 +2166,136 @@ static int state_probe(const cc_config_t *cfg)
     return state_probe_once(cfg);
 }
 
-/* 上报云端并记录「云端当前显示什么」，状态同步据此判断是否需要纠偏。 */
+/*
+ * state_sync_allowed - 是否允许「周期探测」主动把状态推给巴法云。
+ *
+ * 三道门槛：state_sync 开关、client_id 非空、服务已启用。
+ * enabled=0 时仍会周期探测并写状态文件（见 run_daemon 外层循环），只是
+ * 不主动上报；HTTP push 本身不依赖 TCP 长连接，断网时 curl 会失败，交给
+ * cloud_report 的失败退避在后续周期补齐。
+ * 注意：这只约束「主动同步」，动作执行后的结果回报仍照常调用 cloud_report，
+ * 不受本函数限制（小爱必须能看到动作结果）。
+ */
+static int state_sync_allowed(const cc_config_t *cfg)
+{
+    return (cfg != NULL &&
+            strcmp(cfg->state_sync, "1") == 0 &&
+            cfg->client_id[0] != '\0' &&
+            strcmp(cfg->enabled, "1") == 0);
+}
+
+/* 当前真实状态与「最后成功上报值」是否不一致。 */
+static int state_cloud_differs(void)
+{
+    if (g_host_state == HOST_UNKNOWN)
+        return 0;
+    return strcmp(g_cloud_state, state_name(g_host_state)) != 0;
+}
+
+/*
+ * cloud_report - 上报云端并记录「插件最后成功推了什么」。
+ *
+ * 语义澄清：巴法云只有上报（push）接口，没有查询接口。g_cloud_state 是
+ * 插件本地记录的「最后成功上报值」，不是向云端查询到的当前显示；状态文件
+ * 里的 cloud_confirmed / cloud_pending 如实标注这一点。
+ *
+ * 成功：记录已确认值、刷新 60 秒节流起点、清掉待补发标记。
+ * 失败：curl 缺失 / 网络抖动 / 主题错误时不再「丢弃这次同步」，而是置
+ *       g_state_dirty 并设 30 秒退避，由 state_sync_pending 后续补齐。
+ *       仅当允许主动同步时才置标记，保证 state_sync=0 不产生主动上报。
+ */
 static int cloud_report(const cc_config_t *cfg, const char *msg)
 {
     int rc = bemfa_push(cfg, msg);
+    time_t now = time(NULL);
 
-    if (rc == 0)
+    if (rc == 0) {
         cc_strlcpy(g_cloud_state, msg, sizeof(g_cloud_state));
+        g_cloud_confirmed = 1;
+        g_state_push_at = now;
+        g_state_dirty = 0;
+        g_state_retry_at = 0;
+        g_state_wait_logged = 0;
+    } else if (state_sync_allowed(cfg)) {
+        g_state_dirty = 1;
+        g_state_retry_at = now + STATE_RETRY_GAP;
+        g_state_wait_logged = 1;   /* 失败已单独记日志，别再重复刷「等待」 */
+        log_write("WARN", "上报失败，%d 秒后重试（msg=%s，当前状态待同步）",
+                  STATE_RETRY_GAP, msg);
+    }
 
     return rc;
+}
+
+/*
+ * state_mark_dirty - 周期探测提交了一个真实状态（首次 / 确认变化）后调用。
+ * 只记下「还有一次上报没落地」，真正发 HTTP 交给 state_sync_pending。
+ */
+static void state_mark_dirty(const cc_config_t *cfg)
+{
+    if (!state_sync_allowed(cfg))
+        return;
+    if (!state_cloud_differs())
+        return;
+
+    g_state_dirty = 1;
+    g_state_wait_logged = 0;
+}
+
+/*
+ * state_sync_pending - 每一轮周期检查都调用，负责把「欠着的上报」补齐。
+ *
+ * 这是状态同步不丢的关键：状态变化被 60 秒节流拦下、或 cloud_report
+ * 失败之后 g_state_dirty 会一直留着；即使之后状态不再变化（走
+ * observed == g_host_state 分支），这里也会在窗口/退避到期后补发一次，
+ * 不会像 2.2.0 那样永久丢失、非要等下次状态变化或进程重启才恢复。
+ */
+static void state_sync_pending(const cc_config_t *cfg, time_t now)
+{
+    const char *nm;
+    time_t eligible = 0;
+    long wait;
+
+    if (!g_state_dirty)
+        return;
+
+    if (!state_sync_allowed(cfg)) {
+        /* 主动同步被关闭：取消待补发标记，页面不再显示「待同步」，
+           也确保 state_sync=0 / enabled=0 / 无 client_id 时绝不主动上报。 */
+        g_state_dirty = 0;
+        g_state_retry_at = 0;
+        g_state_wait_logged = 0;
+        return;
+    }
+
+    if (!state_cloud_differs()) {
+        g_state_dirty = 0;
+        g_state_retry_at = 0;
+        g_state_wait_logged = 0;
+        return;
+    }
+
+    nm = state_name(g_host_state);
+
+    /* 60 秒最小间隔 + 失败退避，取两者中更晚的那个作为可试时刻 */
+    if (g_state_push_at > 0)
+        eligible = g_state_push_at + STATE_PUSH_MIN_GAP;
+    if (g_state_retry_at > eligible)
+        eligible = g_state_retry_at;
+
+    if (now < eligible) {
+        if (!g_state_wait_logged) {
+            wait = (long)(eligible - now);
+            log_write("INFO", "状态已变化，等待同步窗口（约 %ld 秒后补发 %s）",
+                      wait, nm);
+            g_state_wait_logged = 1;
+        }
+        return;
+    }
+
+    if (cloud_report(cfg, nm) == 0)
+        log_write("INFO", "已补齐上报：真实状态 %s 已同步到云端", nm);
+    /* 失败时的退避与日志由 cloud_report 统一处理，这里不重复 */
 }
 
 /* 立即提交一个已确认的状态（动作后、查询后使用），不等连续确认。 */
@@ -2168,18 +2348,26 @@ static int state_file_read_cmd(char *out, size_t outsz)
 /*
  * state_observe - 周期探测结果入库。
  * 状态变化需连续 STATE_CONFIRM_N 次一致才提交，防止开机/关机过程中的
- * 短暂抖动让云端状态来回跳。提交后若与云端显示不一致，主动推一次真实状态。
+ * 短暂抖动让云端状态来回跳。提交后若与云端记录不一致，置「待同步」标记。
+ *
+ * 所有分支（含 observed == g_host_state 这个「状态没变」分支）都会调用
+ * state_sync_pending：被 60 秒节流拦下或上报失败的那次状态变化，会在后续
+ * 周期里被补齐，而不是像 2.2.0 一样再也没机会上报。
  */
 static void state_observe(const cc_config_t *cfg, int observed, const char *source)
 {
-    const char *nm;
     char detail[160];
     time_t now = time(NULL);
 
     g_state_checked = now;
 
-    if (observed == HOST_UNKNOWN)
+    if (observed == HOST_UNKNOWN) {
+        state_sync_pending(cfg, now);
+        /* 补发可能刚更新了 g_cloud_state / dirty，必须落盘，否则页面会
+           一直显示过期的「已上报 / 有待同步」。顺序不能反：先补发后写文件。 */
+        state_file_write(cfg);
         return;
+    }
 
     /* 首次探测直接提交，页面不必等两轮确认才有内容可显示 */
     if (g_host_state == HOST_UNKNOWN) {
@@ -2192,15 +2380,9 @@ static void state_observe(const cc_config_t *cfg, int observed, const char *sour
         cc_strlcpy(g_state_detail, detail, sizeof(g_state_detail));
         log_write("INFO", "初始状态：%s（%s）", state_name(observed), detail);
 
-        nm = (observed == HOST_ON) ? "on" : "off";
-        if (strcmp(cfg->state_sync, "1") == 0 &&
-            cfg->client_id[0] != '\0' &&
-            strcmp(g_cloud_state, nm) != 0) {
-            if (cloud_report(cfg, nm) == 0) {
-                g_state_push_at = now;
-                log_write("INFO", "已把初始状态 %s 同步到云端", nm);
-            }
-        }
+        /* 初始状态也走统一的「标记 → 尝试 → 失败退避」逻辑 */
+        state_mark_dirty(cfg);
+        state_sync_pending(cfg, now);
         state_file_write(cfg);
         return;
     }
@@ -2208,6 +2390,8 @@ static void state_observe(const cc_config_t *cfg, int observed, const char *sour
     if (observed == g_host_state) {
         g_state_candidate = observed;
         g_state_streak = 0;
+        /* 关键：状态没变也要检查有没有「欠着一次上报」 */
+        state_sync_pending(cfg, now);
         state_file_write(cfg);       /* 刷新探测时间，让页面知道守护进程活着 */
         return;
     }
@@ -2217,34 +2401,32 @@ static void state_observe(const cc_config_t *cfg, int observed, const char *sour
         g_state_streak = 1;
         log_write("INFO", "检测到状态可能变为 %s，等待再次确认",
                   state_name(observed));
+        /* 等待二次确认期间也不放过期欠着的上报 */
+        state_sync_pending(cfg, now);
         return;
     }
 
     g_state_streak++;
-    if (g_state_streak < STATE_CONFIRM_N)
+    if (g_state_streak < STATE_CONFIRM_N) {
+        state_sync_pending(cfg, now);
         return;
+    }
 
     g_host_state = observed;
     g_state_streak = 0;
-    nm = (observed == HOST_ON) ? "on" : "off";
 
     snprintf(detail, sizeof(detail), "周期探测：目标机 SSH 端口 %s",
              (observed == HOST_ON) ? "可连接" : "无响应");
     cc_strlcpy(g_state_source, source, sizeof(g_state_source));
     cc_strlcpy(g_state_detail, detail, sizeof(g_state_detail));
 
-    log_write("INFO", "目标机状态已确认为 %s（%s）", nm, detail);
+    log_write("INFO", "目标机状态已确认为 %s（%s）",
+              state_name(observed), detail);
 
-    /* 只在「状态变了、和云端不一致、且过了节流窗口」时纠偏一次 */
-    if (strcmp(cfg->state_sync, "1") == 0 &&
-        cfg->client_id[0] != '\0' &&
-        strcmp(g_cloud_state, nm) != 0 &&
-        now - g_state_push_at >= STATE_PUSH_MIN_GAP) {
-        if (cloud_report(cfg, nm) == 0) {
-            g_state_push_at = now;
-            log_write("INFO", "已把真实状态 %s 同步到云端", nm);
-        }
-    }
+    /* 任何一次真实状态变化被提交都置 dirty；随后立刻尝试一次。
+       被节流拦下只是「留到下次补」，不再是一次性丢弃。 */
+    state_mark_dirty(cfg);
+    state_sync_pending(cfg, now);
 
     state_file_write(cfg);
 }
@@ -2713,6 +2895,29 @@ static void setup_signals(void)
 /* 主循环                                                             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * cc_wait_retry - 失败路径 sleep 时扣掉本轮周期探测已经花掉的时间。
+ *
+ * 2.2.1 把 state_periodic 移到了外层循环顶部，state_probe 最坏会占几秒；
+ * 不扣的话原来的 10 / 30 秒重连节奏会一直被往后拖。耗时异常（时钟跳变、
+ * 探测卡住）时夹在 [0, secs-1]，保证至少睡 1 秒，绝不空转刷屏。
+ */
+static void cc_wait_retry(int secs, time_t started)
+{
+    long spent = (long)(time(NULL) - started);
+    long left;
+
+    if (spent < 0)
+        spent = 0;
+    if (spent > secs - 1)
+        spent = secs - 1;
+
+    left = secs - spent;
+    if (left < 1)
+        left = 1;
+    sleep((unsigned int)left);
+}
+
 /* 守护进程主体：连接 - 订阅 - 收包 - 心跳 - 定期复查配置。 */
 static int run_daemon(void)
 {
@@ -2728,6 +2933,7 @@ static int run_daemon(void)
     time_t last_hb = 0;
     time_t last_check = 0;
     time_t now = 0;
+    time_t loop_at = 0;
 
     memset(buf, 0, sizeof(buf));
     memset(cur_uid, 0, sizeof(cur_uid));
@@ -2737,19 +2943,37 @@ static int run_daemon(void)
     g_running = 1;
 
     while (g_running) {
+        loop_at = time(NULL);
+
         if (cfg_load(&cfg) != 0) {
             log_write("WARN", "配置读取异常，将使用默认值重试");
         }
 
+        /*
+         * 周期探测与巴法云连接状态解耦（2.2.1）：
+         * 放在所有 continue 之前，enabled=0 / client_id 或 topic 为空 /
+         * 连不上服务器 / 订阅失败时，也照样探测并写状态文件，页面
+         * 「设备状态（实时）」和「重新探测」始终可用。
+         * 首次进入时 g_state_checked==0，这里会立刻探一次，等价于原先
+         * 「订阅成功后 force 一次」的效果；state_periodic 内部按
+         * g_state_checked + 配置间隔自闸门，内层循环再调用一次也不会
+         * 双重计时。云端上报由 state_sync_allowed 单独把关（enabled=0
+         * 或 state_sync=0 时不主动推），HTTP push 不需要长连接，断网时
+         * curl 失败后由 cloud_report 的 30 秒退避在后续周期补齐。
+         * 失败路径的 sleep 改成 cc_wait_retry()，扣掉本轮探测耗时，
+         * 保持原来的 10 / 30 秒重连节奏不被拖慢。
+         */
+        state_periodic(&cfg, 0);
+
         if (strcmp(cfg.enabled, "1") != 0) {
             log_write("INFO", "服务未启用（enabled=0），30 秒后复查配置");
-            sleep(30);
+            cc_wait_retry(30, loop_at);
             continue;
         }
 
         if (cfg.client_id[0] == '\0' || cfg.topic[0] == '\0') {
             log_write("ERROR", "client_id 或 topic 为空，30 秒后重试");
-            sleep(30);
+            cc_wait_retry(30, loop_at);
             continue;
         }
 
@@ -2761,14 +2985,14 @@ static int run_daemon(void)
         if (sock < 0) {
             log_write("ERROR", "连接 %s:%d 失败，%d 秒后重试",
                       BEMFA_HOST, BEMFA_PORT, RETRY_DELAY_SEC);
-            sleep(RETRY_DELAY_SEC);
+            cc_wait_retry(RETRY_DELAY_SEC, loop_at);
             continue;
         }
 
         if (bemfa_subscribe(sock, &cfg) != 0) {
             close(sock);
             sock = -1;
-            sleep(RETRY_DELAY_SEC);
+            cc_wait_retry(RETRY_DELAY_SEC, loop_at);
             continue;
         }
 
@@ -2783,8 +3007,8 @@ static int run_daemon(void)
 
         log_write("INFO", "订阅成功，进入监听循环");
 
-        /* 连接建立后立刻探一次，状态文件不用等一个探测周期才出现 */
-        state_periodic(&cfg, 1);
+        /* 首次探测已在外层循环顶部完成（g_state_checked==0 时立即执行），
+           这里不再 force，避免与外层重复计时。 */
 
         /* ---------------- 内层：单次连接的收发循环 ---------------- */
         while (g_running) {
@@ -2865,7 +3089,9 @@ static int run_daemon(void)
 
             now = time(NULL);
 
-            /* 周期探测目标机真实状态；状态变化时把云端纠偏过来 */
+            /* 长连接健康时由内层每秒检查一次；state_periodic 内部按
+               g_state_checked + 配置间隔自闸门，与外层循环顶部那次不会
+               双重计时。状态变化时置 dirty，随后由 state_sync_pending 补齐。 */
             state_periodic(&cfg, 0);
 
             /* 心跳 */
@@ -3168,6 +3394,14 @@ int main(int argc, char **argv)
      */
     cc_init_timezone();
 
+    /*
+     * 状态文件由守护进程和 -t 单次命令共享。把上一次「已确认成功上报」
+     * 的本地记录读回来，避免页面点一次「重新探测」就把 cloud= 清成
+     * 「尚未成功上报」，也让守护进程重启后仍知道云端停在哪一档、以及
+     * 有没有欠着一次上报（cloud_pending）。
+     */
+    state_file_restore_cloud();
+
     while ((opt = getopt(argc, argv, "dt:h")) != -1) {
         switch (opt) {
         case 'd':
@@ -3326,9 +3560,21 @@ int main(int argc, char **argv)
                      (st == HOST_ON) ? "可连接" : "无响应");
             state_force(&cfg, st, "push", detail);
             rc = cloud_report(&cfg, msg);
-            state_file_write(&cfg);     /* 刷新 cloud= 一栏 */
-            fprintf(stdout, "结果：%s - 已把当前状态 %s 上报巴法云\n",
-                    rc == 0 ? "成功" : "失败", msg);
+            state_file_write(&cfg);     /* 刷新 cloud= / cloud_confirmed= / cloud_pending= */
+            if (rc == 0) {
+                fprintf(stdout,
+                        "结果：成功 - 已把当前状态 %s 上报巴法云（curl 退出码 0）\n"
+                        "说明：巴法云只有上报接口，这里是「推送成功」的本地记录，"
+                        "不是向云端查询到的当前显示。\n",
+                        msg);
+            } else {
+                fprintf(stdout,
+                        "结果：失败 - 当前状态 %s 未能上报巴法云（curl exit=%d）\n"
+                        "说明：云端显示可能仍是旧值。请检查 curl / 网络 / 主题名；"
+                        "也可往主题发 msg=status 让守护进程回推真实状态，"
+                        "或开启「周期同步状态」由守护进程在状态变化时自动补发。\n",
+                        msg, rc);
+            }
 
         } else {
             fprintf(stdout, "结果：失败 - 未知测试类型 [%s]\n", test_mode);

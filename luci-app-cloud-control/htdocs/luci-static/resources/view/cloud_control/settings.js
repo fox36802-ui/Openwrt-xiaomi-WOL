@@ -195,10 +195,13 @@ return view.extend({
 		/* ============================================================
 		 * 设备状态（实时）—— 不再是「只发指令、不知结果」
 		 * ============================================================ */
-		s = m.section(form.NamedSection, 'main', 'main', _('设备状态（实时）'));
-		s.description = _('状态来自对目标机 SSH 端口的真实探测，不是「上次下发了什么指令」。' +
-		                  '守护进程每 30 秒探测一次；服务没启动时可以点「重新探测」手动查一次。' +
-		                  '另外可以在巴法云控制台往本主题发 msg=status，插件会把当前状态回推到云端。');
+	s = m.section(form.NamedSection, 'main', 'main', _('设备状态（实时）'));
+	s.description = _('状态来自对目标机 SSH 端口的真实探测，不是「上次下发了什么指令」。' +
+	                  '守护进程每 30 秒探测一次，手动开机 / 关机后需连续两次一致才确认（约 1 分钟）；' +
+	                  '随后若与云端记录不一致，会在 60 秒同步窗口过后自动补发，上报失败则每 30 秒重试。' +
+	                  '断网、配置不全或服务未启用时，本地探测与页面状态仍会照常更新（只是不上报云端）。' +
+	                  '服务没启动时可以点「重新探测」手动查一次。' +
+	                  '另外可以在巴法云控制台往本主题发 msg=status，插件会把当前状态回推到云端。');
 
 		o = s.option(form.DummyValue, '_host_state', _('目标机当前状态'));
 		o.cfgvalue = function() {
@@ -229,13 +232,26 @@ return view.extend({
 			var st = RT.state;
 			var cmd = st.last_cmd && st.last_cmd !== '-' ? st.last_cmd : '-';
 			var cloud = st.cloud || 'unknown';
-			var cloudText = (cloud === 'on') ? _('开机') :
-			                ((cloud === 'off') ? _('关机') : _('尚未上报'));
+			/* cloud= 只是插件本地记录的「最后成功上报值」，巴法云没有查询接口，
+			   不能假装在向云端查询。如实标注，未确认过就直说尚未成功上报。 */
+			var confirmed = (st.cloud_confirmed === '1');
+			var pending = (st.cloud_pending === '1');
+			var cloudLabel = (cloud === 'on') ? _('开机') :
+			                 ((cloud === 'off') ? _('关机') : _('未知'));
+			var cloudText;
+
+			if (!confirmed || cloud === 'unknown')
+				cloudText = _('尚未成功上报（本地记录，未向云端查询）');
+			else
+				cloudText = _('云端已上报：%s（本地记录，未向云端查询）').format(cloudLabel);
+
+			if (pending)
+				cloudText += _(' ｜ 有新状态待同步，插件会自动补发');
 
 			return E('div', { 'style': 'font-size:12px;line-height:1.8;color:#666' }, [
 				E('div', {}, _('指令：%s ｜ 时间：%s').format(cmd, st.last_cmd_at || '-')),
 				E('div', {}, _('结果：%s').format(st.last_result || '-')),
-				E('div', {}, _('云端已上报：%s').format(cloudText)),
+				E('div', {}, cloudText),
 				E('div', {}, _('状态快照：%s ｜ 版本 %s').format(st.source || '-', st.version || '-'))
 			]);
 		};
@@ -278,7 +294,8 @@ return view.extend({
 		};
 
 		o = s.option(form.Button, '_st_push', _('同步状态到云端'),
-			_('把当前探测到的真实状态主动推给巴法云，用于纠正云端显示不一致。'));
+			_('把当前探测到的真实状态主动推给巴法云，用于纠正云端显示不一致。' +
+			  '弹窗会明确显示推送成功或失败；巴法云只有上报接口，插件不会去查询云端当前显示。'));
 		o.inputtitle = _('同步');
 		o.inputstyle = 'action';
 		o.onclick = function() {
@@ -292,7 +309,7 @@ return view.extend({
 		s.description = _('巴法云（bemfa.com）把「小爱同学 / 米家」的指令通过 TCP 长连接推送到路由器。');
 
 		o = s.option(form.Flag, 'enabled', _('启用服务'),
-			_('关闭后守护进程不会连接巴法云，也不会响应任何指令。'));
+			_('关闭后守护进程不会连接巴法云，也不会响应任何指令；但仍会继续探测目标机状态并更新本页面，只是不主动上报云端。'));
 		o.rmempty = false;
 		o.default = '0';
 
@@ -394,8 +411,10 @@ return view.extend({
 		o.rmempty = true;
 
 		o = s.option(form.Flag, 'state_sync', _('周期探测并同步真实状态到云端'),
-			_('守护进程定时探测目标机 SSH 端口；状态变化且云端显示不一致时，主动把真实状态推给巴法云。' +
-			  '这样小爱 / 控制台看到的是电脑的实际状态，而不是上一次下发的指令。'));
+			_('守护进程定时探测目标机 SSH 端口；状态变化且云端记录不一致时，主动把真实状态推给巴法云。' +
+			  '60 秒最小间隔内被拦下的变化不会丢弃，会在窗口过后自动补发；上报失败每 30 秒重试一次。' +
+			  '关闭后本地探测和状态文件照常更新、动作执行后的结果回报也保留，只是不再主动同步云端。' +
+			  '关闭期间发生的状态变化不会追溯补发；重新启用只对此后新发生的变化生效。需要立即纠偏，请点「同步状态到云端」或往主题发 msg=status。'));
 		o.default = '1';
 		o.rmempty = false;
 

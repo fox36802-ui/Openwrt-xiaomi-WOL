@@ -26,7 +26,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOOLCHAIN=""
 CC_OVERRIDE=""
 ARCH="x86_64"
-VERSION="2.2.0"
+VERSION="2.2.1"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
