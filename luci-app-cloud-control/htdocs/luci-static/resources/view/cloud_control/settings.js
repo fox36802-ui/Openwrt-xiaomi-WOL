@@ -21,6 +21,7 @@
 var DAEMON  = '/usr/bin/cloud_control';
 var INITD   = '/etc/init.d/cloud_control';
 var LOGFILE = '/var/log/cloud_control.log';
+var STATEFILE = '/var/run/cloud_control.state';   /* 守护进程写、页面读 */
 
 /* 查询 procd 服务状态：比 ps | grep 稳，且不受进程名截断影响 */
 var callServiceList = rpc.declare({
@@ -33,7 +34,8 @@ var callServiceList = rpc.declare({
 /* 渲染前要准备好的运行时信息 */
 var RT = {
 	running: false,
-	logtext: ''
+	logtext: '',
+	state: {}
 };
 
 function loadStatus() {
@@ -67,11 +69,28 @@ function loadLog() {
 	});
 }
 
+/* 读取守护进程写下的状态快照（key=value 纯文本，无需 JSON 解析） */
+function loadState() {
+	return fs.read(STATEFILE, 8192).then(function(data) {
+		var obj = {};
+
+		String(data || '').replace(/\r/g, '').split('\n').forEach(function(l) {
+			var i = l.indexOf('=');
+			if (i > 0)
+				obj[l.slice(0, i)] = l.slice(i + 1);
+		});
+
+		RT.state = obj;
+	}).catch(function() {
+		RT.state = {};
+	});
+}
+
 /*
  * 执行一条命令并用弹窗展示结果。
  * 失败不抛异常，避免一次命令失败把整页交互卡住。
  */
-function runAction(argv, title) {
+function runAction(argv, title, reloadAfter) {
 	return fs.exec(argv[0], argv.slice(1)).then(function(res) {
 		var ok = res && res.code === 0;
 		var out = '';
@@ -93,7 +112,11 @@ function runAction(argv, title) {
 			E('div', { 'style': 'margin-top:14px;text-align:right' }, [
 				E('button', {
 					'class': 'btn cbi-button',
-					'click': ui.hideModal
+					'click': function() {
+					ui.hideModal();
+					if (reloadAfter)
+						window.location.reload();
+				}
 				}, _('关闭'))
 			])
 		]);
@@ -107,7 +130,8 @@ return view.extend({
 		return Promise.all([
 			uci.load('cloud_control'),
 			loadStatus(),
-			loadLog()
+			loadLog(),
+			loadState()
 		]);
 	},
 
@@ -166,6 +190,99 @@ return view.extend({
 		o.inputstyle = 'action';
 		o.onclick = function() {
 			return runAction([ INITD, 'restart' ], _('重启服务'));
+		};
+
+		/* ============================================================
+		 * 设备状态（实时）—— 不再是「只发指令、不知结果」
+		 * ============================================================ */
+		s = m.section(form.NamedSection, 'main', 'main', _('设备状态（实时）'));
+		s.description = _('状态来自对目标机 SSH 端口的真实探测，不是「上次下发了什么指令」。' +
+		                  '守护进程每 30 秒探测一次；服务没启动时可以点「重新探测」手动查一次。' +
+		                  '另外可以在巴法云控制台往本主题发 msg=status，插件会把当前状态回推到云端。');
+
+		o = s.option(form.DummyValue, '_host_state', _('目标机当前状态'));
+		o.cfgvalue = function() {
+			var st = RT.state.state || 'unknown';
+			var color = (st === 'on') ? '#00a65a' : ((st === 'off') ? '#888888' : '#dd4b39');
+			var label = (st === 'on') ? _('● 开机中') :
+			            ((st === 'off') ? _('○ 已关机') : _('? 未知'));
+			var box = E('span', {}, [
+				E('span', { 'style': 'font-size:15px;font-weight:bold;color:' + color }, label)
+			]);
+
+			if (!RT.state.state) {
+				box.appendChild(E('div', {
+					'style': 'margin-top:6px;color:#dd4b39;font-size:12px'
+				}, _('尚未读到状态：服务可能未启动、状态文件还没生成，或配置里没填主机 IP')));
+			} else {
+				box.appendChild(E('div', {
+					'style': 'margin-top:6px;color:#666;font-size:12px'
+				}, _('最后探测：%s ｜ 依据：%s').format(
+					RT.state.updated || '-', RT.state.detail || '-')));
+			}
+
+			return box;
+		};
+
+		o = s.option(form.DummyValue, '_last_action', _('最后一次动作 / 云端状态'));
+		o.cfgvalue = function() {
+			var st = RT.state;
+			var cmd = st.last_cmd && st.last_cmd !== '-' ? st.last_cmd : '-';
+			var cloud = st.cloud || 'unknown';
+			var cloudText = (cloud === 'on') ? _('开机') :
+			                ((cloud === 'off') ? _('关机') : _('尚未上报'));
+
+			return E('div', { 'style': 'font-size:12px;line-height:1.8;color:#666' }, [
+				E('div', {}, _('指令：%s ｜ 时间：%s').format(cmd, st.last_cmd_at || '-')),
+				E('div', {}, _('结果：%s').format(st.last_result || '-')),
+				E('div', {}, _('云端已上报：%s').format(cloudText)),
+				E('div', {}, _('状态快照：%s ｜ 版本 %s').format(st.source || '-', st.version || '-'))
+			]);
+		};
+
+		o = s.option(form.Button, '_st_reload', _('刷新显示'));
+		o.inputtitle = _('刷新');
+		o.inputstyle = 'action';
+		o.onclick = function() { window.location.reload(); };
+
+		o = s.option(form.Button, '_st_probe', _('重新探测'),
+			_('立即探测一次目标机状态并写入状态快照，不改变电脑开关状态。'));
+		o.inputtitle = _('重新探测');
+		o.inputstyle = 'action';
+		o.onclick = function() {
+			return runAction([ DAEMON, '-t', 'status' ], _('重新探测目标机状态'), true);
+		};
+
+		o = s.option(form.Button, '_st_on', _('立即开机'),
+			_('先查状态：已经开机就只回报、不重复发唤醒包。'));
+		o.inputtitle = _('立即开机');
+		o.inputstyle = 'apply';
+		o.onclick = function() {
+			return runAction([ DAEMON, '-t', 'on' ], _('立即开机'), true);
+		};
+
+		o = s.option(form.Button, '_st_off', _('立即关机'),
+			_('先查状态：已经关机就只回报、不重复下发 SSH 关机。注意本操作会真的关机。'));
+		o.inputtitle = _('立即关机');
+		o.inputstyle = 'reset';
+		o.onclick = function() {
+			return runAction([ DAEMON, '-t', 'off' ], _('立即关机'), true);
+		};
+
+		o = s.option(form.Button, '_st_retry', _('重试上次动作'),
+			_('按状态文件记录的最后一次指令重做一次；若当前状态已经符合，则只回报不重发。'));
+		o.inputtitle = _('重试');
+		o.inputstyle = 'action';
+		o.onclick = function() {
+			return runAction([ DAEMON, '-t', 'retry' ], _('重试上次动作'), true);
+		};
+
+		o = s.option(form.Button, '_st_push', _('同步状态到云端'),
+			_('把当前探测到的真实状态主动推给巴法云，用于纠正云端显示不一致。'));
+		o.inputtitle = _('同步');
+		o.inputstyle = 'action';
+		o.onclick = function() {
+			return runAction([ DAEMON, '-t', 'push' ], _('同步状态到云端'), true);
 		};
 
 		/* ============================================================
@@ -275,6 +392,29 @@ return view.extend({
 		o.default = '256';
 		o.placeholder = '256';
 		o.rmempty = true;
+
+		o = s.option(form.Flag, 'state_sync', _('周期探测并同步真实状态到云端'),
+			_('守护进程定时探测目标机 SSH 端口；状态变化且云端显示不一致时，主动把真实状态推给巴法云。' +
+			  '这样小爱 / 控制台看到的是电脑的实际状态，而不是上一次下发的指令。'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'state_interval', _('状态探测间隔（秒）'),
+			_('默认 30 秒，允许 10 ~ 300。状态变化需要连续两次探测一致才会提交，避免开机过程中的抖动。'));
+		o.datatype = 'range(10, 300)';
+		o.default = '30';
+		o.placeholder = '30';
+		o.rmempty = true;
+
+		o = s.option(form.ListValue, 'retry_times', _('状态未达预期时自动重试次数'),
+			_('动作执行后重新探测状态，若没达到目标状态就重复执行该动作。' +
+			  '默认 0（不重试）；开机 / 关机不稳定时可设为 1 ~ 2。注意主机会被重复操作。'));
+		o.value('0', _('0 次（不重试）'));
+		o.value('1', _('1 次'));
+		o.value('2', _('2 次'));
+		o.value('3', _('3 次'));
+		o.default = '0';
+		o.rmempty = false;
 
 		o = s.option(form.Flag, 'verify_offline', _('关机后确认是否真的离线'),
 			_('下发关机命令后持续探测目标机的 SSH 端口，连续 3 次连不上才认为关机成功，' +

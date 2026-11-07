@@ -8,7 +8,8 @@
 			"uci": [ "cloud_control" ],
 			"file": {
 				"/var/log/cloud_control.log": [ "read" ],
-				"/var/log/cloud_control.log.1": [ "read" ]
+				"/var/log/cloud_control.log.1": [ "read" ],
+				"/var/run/cloud_control.state": [ "read" ]
 			}
 		},
 		"write": {

@@ -34,6 +34,7 @@ if [ -f /etc/config/cloud_control ]; then
 fi
 
 say "清理缓存与日志..."
+rm -f /var/run/cloud_control.state
 rm -f /var/log/cloud_control.log /var/log/cloud_control.log.1
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null

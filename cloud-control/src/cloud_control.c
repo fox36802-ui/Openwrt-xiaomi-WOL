@@ -83,6 +83,31 @@
 #define VERIFY_FAILS_NEEDED 3           /* 连续几次连不上才算离线 */
 #define SSH_TIMEOUT_SEC     15          /* 单次 SSH 执行上限，防止卡死拖垮页面 */
 
+/* ------------------------------------------------------------------ */
+/* 状态回馈（周期探测 + 状态文件 + 云端同步）                          */
+/* ------------------------------------------------------------------ */
+
+/* 状态文件放在 tmpfs，不写 flash；可用 -DSTATE_PATH=... 覆盖以便测试 */
+#ifndef STATE_PATH
+#define STATE_PATH          "/var/run/cloud_control.state"
+#endif
+#define STATE_DEFAULT_CHECK 30          /* 默认探测间隔（秒） */
+#define STATE_MIN_CHECK     10          /* 探测间隔下限，防止刷爆 CPU/网络 */
+#define STATE_MAX_CHECK     300
+#define STATE_PROBE_SEC     2           /* 单次 SSH 端口探测超时 */
+#define STATE_CONFIRM_N     2           /* 状态变化需连续几次一致才提交 */
+#define STATE_PUSH_MIN_GAP  60          /* 状态变化主动上报云端的最小间隔 */
+#define BOOT_CONFIRM_SEC    20          /* 发唤醒包后等待上线的上限 */
+#define ACTION_RETRY_MAX    3           /* retry_times 允许的最大值 */
+
+/* 目标机状态 */
+#define HOST_UNKNOWN        0
+#define HOST_ON             1
+#define HOST_OFF            2
+
+/* 云端查询指令（往主题发 msg=status 即可让插件回推当前状态） */
+#define CMD_QUERY           3
+
 /* 防误动作 / 防死循环 */
 #define ECHO_GUARD_SEC      10          /* 自身回显去重窗口（秒） */
 #define ON_MIN_INTERVAL_SEC  10         /* on  指令最小执行间隔（秒） */
@@ -113,6 +138,9 @@ typedef struct {
     char shutdown_cmd[256]; /* 自定义关机命令，非空时优先 */
     char log_max_kb[16];    /* 日志上限 KB */
     char verify_offline[8]; /* 关机后是否探测确认离线：1 是 / 0 否 */
+    char state_sync[8];     /* 周期探测并把真实状态同步云端：1 是 / 0 否 */
+    char state_interval[16];/* 状态探测间隔（秒） */
+    char retry_times[8];    /* 动作后状态未达预期时的自动重试次数，0 不重试 */
 } cc_config_t;
 
 /* ------------------------------------------------------------------ */
@@ -136,6 +164,23 @@ static int g_verbose = 0;                    /* 测试模式：子进程保留 s
 static char g_last_push_msg[8] = "";         /* 最近一次成功上报的 msg */
 static time_t g_last_push_time = 0;          /* 该次上报的时刻 */
 static time_t g_last_kind_time[3] = { 0, 0, 0 };  /* [1]=on 上次执行, [2]=off 上次执行 */
+
+/*
+ * 目标机状态（真实探测所得，不是「上次下发的指令」）。
+ * 守护进程与 -t 单次命令都会写同一个状态文件，LuCI 页面和云端据此查询。
+ */
+static int  g_host_state     = HOST_UNKNOWN;   /* 已提交的状态 */
+static int  g_state_candidate= HOST_UNKNOWN;   /* 待确认的候选状态 */
+static int  g_state_streak   = 0;              /* 候选连续出现次数 */
+static time_t g_state_checked= 0;              /* 上次探测时刻 */
+static time_t g_state_push_at= 0;              /* 上次主动同步云端的时刻 */
+static char g_cloud_state[8] = "";             /* 最后成功上报云端的状态 */
+static char g_last_cmd[8]    = "";             /* 最后一次动作 on/off */
+static char g_last_result[96]= "";             /* 最后一次动作的结果 */
+static time_t g_last_cmd_at  = 0;
+static char g_state_detail[128] = "尚未探测";   /* 状态判定依据 */
+static char g_state_source[24]  = "init";      /* probe / action / query ... */
+static int  g_action_quick = 0;                /* 页面单次命令：缩短确认等待 */
 
 /* ------------------------------------------------------------------ */
 /* 基础工具                                                           */
@@ -983,6 +1028,12 @@ static void cfg_apply(cc_config_t *cfg, const char *key, const char *val)
         cc_strlcpy(cfg->log_max_kb, val, sizeof(cfg->log_max_kb));
     else if (strcmp(key, "verify_offline") == 0)
         cc_strlcpy(cfg->verify_offline, val, sizeof(cfg->verify_offline));
+    else if (strcmp(key, "state_sync") == 0)
+        cc_strlcpy(cfg->state_sync, val, sizeof(cfg->state_sync));
+    else if (strcmp(key, "state_interval") == 0)
+        cc_strlcpy(cfg->state_interval, val, sizeof(cfg->state_interval));
+    else if (strcmp(key, "retry_times") == 0)
+        cc_strlcpy(cfg->retry_times, val, sizeof(cfg->retry_times));
     else if (strcmp(key, "ip") == 0) {
         /* 向后兼容：老版本用 option ip 表示目标机地址，且不得覆盖 host */
         if (cfg->host[0] == '\0')
@@ -1031,6 +1082,9 @@ static int cfg_load(cc_config_t *cfg)
     cc_strlcpy(cfg->host_os, "windows", sizeof(cfg->host_os));
     cc_strlcpy(cfg->log_max_kb, "256", sizeof(cfg->log_max_kb));
     cc_strlcpy(cfg->verify_offline, "1", sizeof(cfg->verify_offline));
+    cc_strlcpy(cfg->state_sync, "1", sizeof(cfg->state_sync));
+    cc_strlcpy(cfg->state_interval, "30", sizeof(cfg->state_interval));
+    cc_strlcpy(cfg->retry_times, "0", sizeof(cfg->retry_times));
 
     fp = fopen(CFG_PATH, "r");
     if (fp == NULL) {
@@ -1766,7 +1820,12 @@ static int parse_cmd(const char *line)
         if (strcasecmp(value, "on") == 0 || strcasecmp(value, "open") == 0 ||
             strcmp(value, "1") == 0)
             return 1;
-        /* 有字段但不是开关指令（如 msg=hello），一律忽略 */
+        if (strcasecmp(value, "status") == 0 ||
+            strcasecmp(value, "query") == 0 ||
+            strcasecmp(value, "get") == 0 ||
+            strcmp(value, "?") == 0)
+            return CMD_QUERY;
+        /* 有字段但不是开关/查询指令（如 msg=hello），一律忽略 */
         return 0;
     }
 
@@ -1791,6 +1850,12 @@ static int parse_cmd(const char *line)
     if (strcasecmp(trimmed, "on") == 0 || strcasecmp(trimmed, "open") == 0 ||
         strcmp(trimmed, "1") == 0)
         return 1;
+
+    if (strcasecmp(trimmed, "status") == 0 ||
+        strcasecmp(trimmed, "query") == 0 ||
+        strcasecmp(trimmed, "get") == 0 ||
+        strcmp(trimmed, "?") == 0)
+        return CMD_QUERY;
 
     return 0;
 }
@@ -1917,30 +1982,500 @@ static int wait_host_offline(int sock, const cc_config_t *cfg, int timeout_sec)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* 状态回馈：探测 / 状态文件 / 云端同步 / 动作闭环                     */
+/* ------------------------------------------------------------------ */
+
+/* 状态名：只用于日志与状态文件，不参与判断。 */
+static const char *state_name(int st)
+{
+    if (st == HOST_ON)
+        return "on";
+    if (st == HOST_OFF)
+        return "off";
+    return "unknown";
+}
+
+/* 把时间戳格式化成与日志一致的本地时间；0 值写成 "-"。 */
+static void state_stamp(char *buf, size_t sz, time_t t)
+{
+    struct tm tm;
+
+    if (t <= 0) {
+        cc_strlcpy(buf, "-", sz);
+        return;
+    }
+
+    if (localtime_r(&t, &tm) == NULL) {
+        cc_strlcpy(buf, "-", sz);
+        return;
+    }
+
+    strftime(buf, sz, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
+/* 状态文件里不能出现换行，否则页面按行解析会串行。 */
+static void state_flatten(char *s)
+{
+    char *p;
+
+    for (p = s; *p != '\0'; p++) {
+        if (*p == '\r' || *p == '\n' || *p == '\t')
+            *p = ' ';
+    }
+}
+
+/*
+ * state_file_write - 把当前状态原子写入状态文件，供 LuCI 页面和脚本查询。
+ * 先写 .tmp 再 rename，避免读取方看到写了一半的内容。
+ */
+static void state_file_write(const cc_config_t *cfg)
+{
+    char updated[32];
+    char cmd_at[32];
+    char detail[160];
+    char result[128];
+    char tmppath[256];
+    FILE *fp;
+
+    (void)cfg;
+
+    state_stamp(updated, sizeof(updated), g_state_checked);
+    state_stamp(cmd_at, sizeof(cmd_at), g_last_cmd_at);
+    cc_strlcpy(detail, g_state_detail, sizeof(detail));
+    cc_strlcpy(result, g_last_result, sizeof(result));
+    state_flatten(detail);
+    state_flatten(result);
+
+    /* 每个进程用自己的临时文件：守护进程和页面 -t 命令可能同时写 */
+    snprintf(tmppath, sizeof(tmppath), "%s.%d", STATE_PATH, (int)getpid());
+    fp = fopen(tmppath, "w");
+    if (fp == NULL)
+        return;             /* tmpfs 不可写时不阻断主流程 */
+
+    fprintf(fp,
+            "state=%s\n"
+            "updated=%s\n"
+            "source=%s\n"
+            "detail=%s\n"
+            "last_cmd=%s\n"
+            "last_cmd_at=%s\n"
+            "last_result=%s\n"
+            "cloud=%s\n"
+            "pid=%d\n"
+            "version=%s\n",
+            state_name(g_host_state), updated, g_state_source, detail,
+            g_last_cmd[0] ? g_last_cmd : "-", cmd_at,
+            result[0] ? result : "-",
+            g_cloud_state[0] ? g_cloud_state : "unknown",
+            (int)getpid(), CC_VERSION);
+
+    fclose(fp);
+
+    if (rename(tmppath, STATE_PATH) != 0)
+        remove(tmppath);
+}
+
+/* 单次探测 SSH 端口：这就是判断目标机开/关最可靠的通道。 */
+static int state_probe_once(const cc_config_t *cfg)
+{
+    int port;
+
+    if (cfg == NULL || cfg->host[0] == '\0')
+        return HOST_UNKNOWN;
+
+    port = atoi(cfg->ssh_port);
+    if (port <= 0)
+        port = 22;
+
+    return (probe_tcp(cfg->host, port, STATE_PROBE_SEC) == 0)
+           ? HOST_ON : HOST_OFF;
+}
+
+/*
+ * state_probe - 带二次确认的状态探测。
+ * 「不通」时再探一次，避免一次网络抖动就被判定为已关机。
+ */
+static int state_probe(const cc_config_t *cfg)
+{
+    int first = state_probe_once(cfg);
+
+    if (first == HOST_ON || first == HOST_UNKNOWN)
+        return first;
+
+    sleep(1);
+    return state_probe_once(cfg);
+}
+
+/* 上报云端并记录「云端当前显示什么」，状态同步据此判断是否需要纠偏。 */
+static int cloud_report(const cc_config_t *cfg, const char *msg)
+{
+    int rc = bemfa_push(cfg, msg);
+
+    if (rc == 0)
+        cc_strlcpy(g_cloud_state, msg, sizeof(g_cloud_state));
+
+    return rc;
+}
+
+/* 立即提交一个已确认的状态（动作后、查询后使用），不等连续确认。 */
+static void state_force(const cc_config_t *cfg, int st,
+                        const char *source, const char *detail)
+{
+    g_host_state = st;
+    g_state_candidate = st;
+    g_state_streak = 0;
+    g_state_checked = time(NULL);
+    cc_strlcpy(g_state_source, source, sizeof(g_state_source));
+    cc_strlcpy(g_state_detail, detail, sizeof(g_state_detail));
+    state_file_write(cfg);
+}
+
+/* 从状态文件读出最后一次动作；-t retry 是新进程，只能这样拿上下文。 */
+static int state_file_read_cmd(char *out, size_t outsz)
+{
+    char line[256];
+    FILE *fp;
+
+    if (out == NULL || outsz == 0)
+        return -1;
+
+    out[0] = '\0';
+    fp = fopen(STATE_PATH, "r");
+    if (fp == NULL)
+        return -1;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (strncmp(line, "last_cmd=", 9) == 0) {
+            char *v = line + 9;
+            char *e = strchr(v, '\n');
+
+            if (e != NULL)
+                *e = '\0';
+            e = strchr(v, '\r');
+            if (e != NULL)
+                *e = '\0';
+            cc_strlcpy(out, v, outsz);
+            fclose(fp);
+            return 0;
+        }
+    }
+
+    fclose(fp);
+    return -1;
+}
+
+/*
+ * state_observe - 周期探测结果入库。
+ * 状态变化需连续 STATE_CONFIRM_N 次一致才提交，防止开机/关机过程中的
+ * 短暂抖动让云端状态来回跳。提交后若与云端显示不一致，主动推一次真实状态。
+ */
+static void state_observe(const cc_config_t *cfg, int observed, const char *source)
+{
+    const char *nm;
+    char detail[160];
+    time_t now = time(NULL);
+
+    g_state_checked = now;
+
+    if (observed == HOST_UNKNOWN)
+        return;
+
+    /* 首次探测直接提交，页面不必等两轮确认才有内容可显示 */
+    if (g_host_state == HOST_UNKNOWN) {
+        g_host_state = observed;
+        g_state_candidate = observed;
+        g_state_streak = 0;
+        snprintf(detail, sizeof(detail), "初始探测：目标机 SSH 端口 %s",
+                 (observed == HOST_ON) ? "可连接" : "无响应");
+        cc_strlcpy(g_state_source, source, sizeof(g_state_source));
+        cc_strlcpy(g_state_detail, detail, sizeof(g_state_detail));
+        log_write("INFO", "初始状态：%s（%s）", state_name(observed), detail);
+
+        nm = (observed == HOST_ON) ? "on" : "off";
+        if (strcmp(cfg->state_sync, "1") == 0 &&
+            cfg->client_id[0] != '\0' &&
+            strcmp(g_cloud_state, nm) != 0) {
+            if (cloud_report(cfg, nm) == 0) {
+                g_state_push_at = now;
+                log_write("INFO", "已把初始状态 %s 同步到云端", nm);
+            }
+        }
+        state_file_write(cfg);
+        return;
+    }
+
+    if (observed == g_host_state) {
+        g_state_candidate = observed;
+        g_state_streak = 0;
+        state_file_write(cfg);       /* 刷新探测时间，让页面知道守护进程活着 */
+        return;
+    }
+
+    if (observed != g_state_candidate) {
+        g_state_candidate = observed;
+        g_state_streak = 1;
+        log_write("INFO", "检测到状态可能变为 %s，等待再次确认",
+                  state_name(observed));
+        return;
+    }
+
+    g_state_streak++;
+    if (g_state_streak < STATE_CONFIRM_N)
+        return;
+
+    g_host_state = observed;
+    g_state_streak = 0;
+    nm = (observed == HOST_ON) ? "on" : "off";
+
+    snprintf(detail, sizeof(detail), "周期探测：目标机 SSH 端口 %s",
+             (observed == HOST_ON) ? "可连接" : "无响应");
+    cc_strlcpy(g_state_source, source, sizeof(g_state_source));
+    cc_strlcpy(g_state_detail, detail, sizeof(g_state_detail));
+
+    log_write("INFO", "目标机状态已确认为 %s（%s）", nm, detail);
+
+    /* 只在「状态变了、和云端不一致、且过了节流窗口」时纠偏一次 */
+    if (strcmp(cfg->state_sync, "1") == 0 &&
+        cfg->client_id[0] != '\0' &&
+        strcmp(g_cloud_state, nm) != 0 &&
+        now - g_state_push_at >= STATE_PUSH_MIN_GAP) {
+        if (cloud_report(cfg, nm) == 0) {
+            g_state_push_at = now;
+            log_write("INFO", "已把真实状态 %s 同步到云端", nm);
+        }
+    }
+
+    state_file_write(cfg);
+}
+
+/* 周期状态检查：间隔取自配置并夹在合理区间内。 */
+static void state_periodic(const cc_config_t *cfg, int force)
+{
+    int interval = atoi(cfg->state_interval);
+    time_t now = time(NULL);
+
+    if (interval < STATE_MIN_CHECK)
+        interval = STATE_MIN_CHECK;
+    if (interval > STATE_MAX_CHECK)
+        interval = STATE_MAX_CHECK;
+
+    if (!force && g_state_checked > 0 && now - g_state_checked < interval)
+        return;
+
+    if (cfg->host[0] == '\0')
+        return;
+
+    state_observe(cfg, state_probe(cfg), "probe");
+}
+
+/* 发唤醒包后等待目标机上线；等待期间保持云端心跳。 */
+static int wait_host_online(int sock, const cc_config_t *cfg, int timeout_sec)
+{
+    int hits = 0;
+    time_t start = time(NULL);
+    time_t last_hb = start;
+
+    while ((int)(time(NULL) - start) < timeout_sec) {
+        if (state_probe_once(cfg) == HOST_ON) {
+            hits++;
+            if (hits >= 2)
+                return 1;
+        } else {
+            hits = 0;
+        }
+
+        if (sock >= 0 && time(NULL) - last_hb >= 10) {
+            bemfa_ping(sock);
+            last_hb = time(NULL);
+        }
+
+        sleep(3);
+    }
+
+    return 0;
+}
+
+/*
+ * do_action - 执行一次开关机动作，并完成「查询 → 动作 → 回读」闭环。
+ *
+ * known_state 由调用方传入已探测的状态（HOST_UNKNOWN 表示自己探）：
+ *   已处于目标状态 -> 幂等处理，不重复发指令，只回报当前状态；
+ *   否则先过同类限流闸，再执行动作，动作后回读状态，未达预期按
+ *   retry_times 重试，最后把真实状态写入状态文件并回报云端。
+ *
+ * 返回 0 成功 / 1 失败（云端会收到反向状态）。
+ */
+static int do_action(const cc_config_t *cfg, int kind, int sock,
+                     int verbose, int known_state)
+{
+    int target = (kind == 1) ? HOST_ON : HOST_OFF;
+    const char *want = (kind == 1) ? "on" : "off";
+    const char *back = (kind == 1) ? "off" : "on";
+    int retries = atoi(cfg->retry_times);
+    int attempt;
+    int rc = 0;
+    int confirmed = 0;
+    int observed;
+    int min_gap;
+    int verify_sec = g_action_quick ? 20 : VERIFY_TIMEOUT_SEC;
+    int boot_sec = g_action_quick ? 12 : BOOT_CONFIRM_SEC;
+    time_t now;
+    char detail[160];
+    char note[96];
+
+    if (kind != 1 && kind != 2)
+        return -1;
+
+    if (retries < 0)
+        retries = 0;
+    if (retries > ACTION_RETRY_MAX)
+        retries = ACTION_RETRY_MAX;
+
+    cc_strlcpy(g_last_cmd, want, sizeof(g_last_cmd));
+    g_last_cmd_at = time(NULL);
+
+    observed = (known_state == HOST_UNKNOWN) ? state_probe(cfg) : known_state;
+
+    /* 幂等：当前已经是目标状态，重复指令不产生动作，只回报状态 */
+    if (observed == target) {
+        snprintf(detail, sizeof(detail),
+                 "当前已%s，重复指令 %s 未重复执行动作",
+                 (target == HOST_ON) ? "开机" : "关机", want);
+        cc_strlcpy(g_last_result, "已处于目标状态，跳过重复动作",
+                   sizeof(g_last_result));
+        log_write("INFO", "收到 %s：%s，仅回报当前状态", want, detail);
+        state_force(cfg, observed, "idempotent", detail);
+        cloud_report(cfg, want);
+        return 0;
+    }
+
+    /* 同类指令限流：只在状态尚未达标时生效，避免重复发包 */
+    now = time(NULL);
+    min_gap = (kind == 1) ? ON_MIN_INTERVAL_SEC : OFF_MIN_INTERVAL_SEC;
+
+    if (g_last_kind_time[kind] > 0 &&
+        now - g_last_kind_time[kind] < min_gap) {
+        snprintf(note, sizeof(note), "忽略重复指令（%ld 秒前刚执行，最小间隔 %d 秒）",
+                 (long)(now - g_last_kind_time[kind]), min_gap);
+        log_write("INFO", "%s：%s", want, note);
+        cc_strlcpy(g_last_result, note, sizeof(g_last_result));
+        cloud_report(cfg, (observed == HOST_ON) ? "on" : "off");
+        state_file_write(cfg);
+        return 0;
+    }
+
+    /* 先占位再执行：SSH 可能耗时数秒，避免执行期间重入 */
+    g_last_kind_time[kind] = now;
+
+    for (attempt = 0; attempt <= retries; attempt++) {
+        if (attempt > 0)
+            log_write("WARN", "状态未达预期，第 %d 次重试 %s 动作",
+                      attempt + 1, want);
+
+        if (kind == 1) {
+            rc = do_wol(cfg, verbose);
+            if (rc != 0) {
+                log_write("ERROR", "唤醒包发送失败（exit=%d）", rc);
+                break;
+            }
+            confirmed = wait_host_online(sock, cfg, boot_sec);
+        } else {
+            rc = do_ssh_shutdown(cfg, verbose);
+            if (rc != 0) {
+                log_write("ERROR", "SSH 关机失败（exit=%d）", rc);
+                break;
+            }
+
+            if (strcmp(cfg->verify_offline, "1") == 0)
+                confirmed = wait_host_offline(sock, cfg, verify_sec);
+            else
+                confirmed = 1;
+        }
+
+        if (confirmed)
+            break;
+
+        log_write("WARN", "%s 动作已下发，但状态回读未达预期", want);
+    }
+
+    observed = state_probe(cfg);
+    snprintf(detail, sizeof(detail), "动作 %s 后回读：目标机 SSH 端口 %s",
+             want, (observed == HOST_ON) ? "可连接" : "无响应");
+
+    /*
+     * WoL 是尽力而为的广播包，目标机可能要几十秒才起来；探测不到不代表
+     * 动作失败，所以仍按原语义回报 on，真实状态交给周期探测去纠偏。
+     * 关机路径则严格：只有确认离线才报 off，否则回滚成 on。
+     */
+    if (kind == 1 && rc == 0) {
+        cc_strlcpy(g_last_result,
+                   confirmed ? "唤醒包已发送，目标机已上线"
+                             : "唤醒包已发送，尚未检测到上线（周期探测会继续确认）",
+                   sizeof(g_last_result));
+        log_write("INFO", "收到 on：%s，上报云端 on", g_last_result);
+        cloud_report(cfg, "on");
+        state_force(cfg, observed, "action", detail);
+        return 0;
+    }
+
+    if (kind == 2 && rc == 0 && confirmed) {
+        cc_strlcpy(g_last_result, "关机已执行且确认离线",
+                   sizeof(g_last_result));
+        log_write("INFO", "收到 off：关机已确认，上报云端 off");
+        cloud_report(cfg, "off");
+        state_force(cfg, observed, "action", detail);
+        return 0;
+    }
+
+    cc_strlcpy(g_last_result, "动作未达预期状态", sizeof(g_last_result));
+    log_write("ERROR", "收到 %s：动作未达预期状态，云端状态回报为 %s",
+              want, back);
+    cloud_report(cfg, back);
+    state_force(cfg, observed, "action", detail);
+    return 1;
+}
+
 /*
  * 处理一条云端指令。
- * 关键：先执行动作，成功后才上报云端，保证云端状态与真实一致。
- *
- * 进执行前必须过两道闸，否则会出真机事故：
- *   闸 1 自回显去重：bemfa_push 往同一 topic 推的消息会被本连接收回来，
- *        不去重就变成正反馈（关机后立刻被自己唤醒，或反复唤醒）。
- *   闸 2 同类指令限流：云端重复推送时不连发关机/开机包。
+ * 闸 1（自回显去重）必须留在这里：本连接会把自己的上报收回来。
+ * 其余「查状态 → 幂等 → 限流 → 动作 → 回读」统一交给 do_action。
  */
 static void handle_cmd(const cc_config_t *cfg, int kind, int sock)
 {
     const char *push_msg;
+    char detail[160];
+    int st;
     time_t now;
-    int min_gap;
-    int rc;
+
+    /* 云端主动查询：往主题发 msg=status，插件回推当前真实状态 */
+    if (kind == CMD_QUERY) {
+        now = time(NULL);
+
+        /* 状态太旧就重新探一次，否则直接用缓存，避免每次查询都等 2 秒 */
+        if (g_state_checked == 0 || now - g_state_checked > STATE_MIN_CHECK)
+            st = state_probe(cfg);
+        else
+            st = g_host_state;
+
+        snprintf(detail, sizeof(detail),
+                 "响应状态查询：目标机 SSH 端口 %s",
+                 (st == HOST_ON) ? "可连接" : "无响应");
+        state_force(cfg, st, "query", detail);
+
+        push_msg = (st == HOST_ON) ? "on" :
+                   ((st == HOST_OFF) ? "off" :
+                    (g_cloud_state[0] ? g_cloud_state : "off"));
+        log_write("INFO", "收到状态查询，回推当前状态 %s", push_msg);
+        cloud_report(cfg, push_msg);
+        return;
+    }
 
     if (kind != 1 && kind != 2)
         return;
 
-    now = time(NULL);
     push_msg = (kind == 1) ? "on" : "off";
-
-    /* on 失败后用户可能立刻重试，窗口要短；off 要挡住延迟回显，窗口要长 */
-    min_gap = (kind == 1) ? ON_MIN_INTERVAL_SEC : OFF_MIN_INTERVAL_SEC;
+    now = time(NULL);
 
     /* 闸 1：本条指令与我们刚上报的内容相同且在去重窗口内 -> 是自身回显 */
     if (g_last_push_msg[0] != '\0' &&
@@ -1952,54 +2487,11 @@ static void handle_cmd(const cc_config_t *cfg, int kind, int sock)
         return;
     }
 
-    /* 闸 2：同一种指令在最小间隔内重复到达 -> 丢弃 */
-    if (g_last_kind_time[kind] > 0 &&
-        now - g_last_kind_time[kind] < min_gap) {
-        log_write("INFO", "忽略重复指令：%s（%ld 秒前刚执行过，最小间隔 %d 秒）",
-                  push_msg, (long)(now - g_last_kind_time[kind]), min_gap);
-        return;
-    }
-
-    /* 先占位再执行：SSH 可能耗时数秒，避免执行期间重入 */
-    g_last_kind_time[kind] = now;
-
-    if (kind == 1) {
-        /* 开机 */
-        rc = do_wol(cfg, 0);
-        if (rc == 0) {
-            log_write("INFO", "收到 on：已向 %s 发送唤醒魔术包", cfg->mac);
-        } else {
-            log_write("ERROR", "收到 on：唤醒包发送失败（exit=%d）", rc);
-        }
-        /* 无论成败都回报 on（反映"已执行开机动作"的意图） */
-        bemfa_push(cfg, "on");
-    } else {
-        /* 关机 */
-        rc = do_ssh_shutdown(cfg, 0);
-        if (rc != 0) {
-            log_write("ERROR", "收到 off：SSH 关机失败（exit=%d），云端状态回滚为 on", rc);
-            bemfa_push(cfg, "on");
-            return;
-        }
-
-        /*
-         * SSH 返回 0 只代表「指令被接受」，不代表机器真的关了：
-         * /t 0 会让会话被掐断拿不到退出码，Windows 也可能因策略拒绝执行。
-         * 所以按配置再确认一次——探测 SSH 端口，连不上了才算真的关掉。
-         */
-        if (strcmp(cfg->verify_offline, "1") == 0 &&
-            wait_host_offline(sock, cfg, VERIFY_TIMEOUT_SEC) == 0) {
-            log_write("ERROR",
-                      "收到 off：SSH 指令已被接受，但 %d 秒内 %s 仍在响应，判定关机失败，"
-                      "云端状态回滚为 on",
-                      VERIFY_TIMEOUT_SEC, cfg->host);
-            bemfa_push(cfg, "on");
-            return;
-        }
-
-        log_write("INFO", "收到 off：关机已确认，上报云端 off");
-        bemfa_push(cfg, "off");
-    }
+    /*
+     * 先查真实状态再决定动作：重复指令不再盲发，
+     * 已处于目标状态时直接回报，这正是「基于状态的操作」而非单向发送。
+     */
+    do_action(cfg, kind, sock, 0, state_probe(cfg));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2291,6 +2783,9 @@ static int run_daemon(void)
 
         log_write("INFO", "订阅成功，进入监听循环");
 
+        /* 连接建立后立刻探一次，状态文件不用等一个探测周期才出现 */
+        state_periodic(&cfg, 1);
+
         /* ---------------- 内层：单次连接的收发循环 ---------------- */
         while (g_running) {
             fd_set rfds;
@@ -2369,6 +2864,9 @@ static int run_daemon(void)
             }
 
             now = time(NULL);
+
+            /* 周期探测目标机真实状态；状态变化时把云端纠偏过来 */
+            state_periodic(&cfg, 0);
 
             /* 心跳 */
             if (now - last_hb >= HEARTBEAT_SEC) {
@@ -2642,6 +3140,11 @@ static void usage(const char *prog)
             "  -t wol       执行一次 Wake-on-LAN 测试\n"
             "  -t ssh       执行一次 SSH 关机测试\n"
             "  -t cloud     测试巴法云连接（8 秒超时）\n"
+            "  -t status    重新探测目标机状态并写入状态文件\n"
+            "  -t on        立即开机（已是开机状态则幂等跳过）\n"
+            "  -t off       立即关机（已是关机状态则幂等跳过）\n"
+            "  -t retry     按状态文件记录的最后一次动作重做一次\n"
+            "  -t push      把当前真实状态主动上报巴法云\n"
             "  -h           显示本帮助\n",
             prog);
 }
@@ -2685,6 +3188,7 @@ int main(int argc, char **argv)
     /* ---------------- 测试模式 ---------------- */
     if (test_mode != NULL) {
         g_verbose = 1;
+        g_action_quick = 1;   /* 页面按钮：缩短确认等待，别把 XHR 拖超时 */
         g_log_to_stdout = 1;
         g_log_to_file = 0;
 
@@ -2760,6 +3264,72 @@ int main(int argc, char **argv)
 
             fprintf(stdout, "结果：%s - 巴法云 %s:%d\n",
                     rc == 0 ? "成功" : "失败", BEMFA_HOST, BEMFA_PORT);
+        } else if (strcmp(test_mode, "status") == 0) {
+            int st;
+            char detail[160];
+
+            if (cfg.host[0] == 0) {
+                fprintf(stdout, "结果：失败 - 未配置目标主机 IP\n");
+                return 1;
+            }
+
+            st = state_probe(&cfg);
+            snprintf(detail, sizeof(detail),
+                     "手动重新探测：目标机 SSH 端口 %s",
+                     (st == HOST_ON) ? "可连接" : "无响应");
+            state_force(&cfg, st, "manual", detail);
+
+            fprintf(stdout,
+                    "当前状态：%s\n"
+                    "判定依据：%s\n"
+                    "状态文件：%s\n",
+                    state_name(st), detail, STATE_PATH);
+            rc = (st == HOST_UNKNOWN) ? 1 : 0;
+
+        } else if (strcmp(test_mode, "on") == 0 ||
+                   strcmp(test_mode, "off") == 0 ||
+                   strcmp(test_mode, "retry") == 0) {
+            char last[16];
+            int kind;
+
+            if (strcmp(test_mode, "retry") == 0) {
+                if (state_file_read_cmd(last, sizeof(last)) != 0 ||
+                    (strcmp(last, "on") != 0 && strcmp(last, "off") != 0)) {
+                    fprintf(stdout,
+                            "结果：失败 - 状态文件里没有可重试的动作（%s）\n",
+                            STATE_PATH);
+                    return 1;
+                }
+                kind = (strcmp(last, "on") == 0) ? 1 : 2;
+                fprintf(stdout, "重试上次动作：%s\n", last);
+            } else {
+                kind = (strcmp(test_mode, "on") == 0) ? 1 : 2;
+            }
+
+            rc = do_action(&cfg, kind, -1, 1, HOST_UNKNOWN);
+            fprintf(stdout, "结果：%s - 动作 %s，%s\n",
+                    rc == 0 ? "成功" : "失败", g_last_cmd, g_last_result);
+
+        } else if (strcmp(test_mode, "push") == 0) {
+            int st;
+            const char *msg;
+            char detail[160];
+
+            if (cfg.host[0] == 0 || cfg.client_id[0] == 0) {
+                fprintf(stdout, "结果：失败 - 未配置目标主机 IP 或 Client ID\n");
+                return 1;
+            }
+
+            st = state_probe(&cfg);
+            msg = (st == HOST_ON) ? "on" : "off";
+            snprintf(detail, sizeof(detail), "手动同步：目标机 SSH 端口 %s",
+                     (st == HOST_ON) ? "可连接" : "无响应");
+            state_force(&cfg, st, "push", detail);
+            rc = cloud_report(&cfg, msg);
+            state_file_write(&cfg);     /* 刷新 cloud= 一栏 */
+            fprintf(stdout, "结果：%s - 已把当前状态 %s 上报巴法云\n",
+                    rc == 0 ? "成功" : "失败", msg);
+
         } else {
             fprintf(stdout, "结果：失败 - 未知测试类型 [%s]\n", test_mode);
             usage(argv[0]);
