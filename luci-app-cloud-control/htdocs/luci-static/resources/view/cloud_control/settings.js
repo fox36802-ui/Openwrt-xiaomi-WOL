@@ -200,14 +200,16 @@ return view.extend({
 	                  '守护进程每 30 秒探测一次，手动开机 / 关机后需连续两次一致才确认（约 1 分钟）；' +
 	                  '随后若与云端记录不一致，会在 60 秒同步窗口过后自动补发，上报失败则每 30 秒重试。' +
 	                  '断网、配置不全或服务未启用时，本地探测与页面状态仍会照常更新（只是不上报云端）。' +
-	                  '服务没启动时可以点「重新探测」手动查一次。' +
+	                  '「重新探测」同样会在状态与云端记录不一致时自动推送。' +
 	                  '另外可以在巴法云控制台往本主题发 msg=status，插件会把当前状态回推到云端。');
 
 		o = s.option(form.DummyValue, '_host_state', _('目标机当前状态'));
 		o.cfgvalue = function() {
 			var st = RT.state.state || 'unknown';
 			var color = (st === 'on') ? '#00a65a' : ((st === 'off') ? '#888888' : '#dd4b39');
-			var label = (st === 'on') ? _('● 开机中') :
+			/* 注意措辞：state=on 就是「已确认端口可连接」的最终状态，
+			   不是开机过程。旧文案「开机中」曾让用户以为还会变成「开机」。 */
+			var label = (st === 'on') ? _('● 已开机') :
 			            ((st === 'off') ? _('○ 已关机') : _('? 未知'));
 			var box = E('span', {}, [
 				E('span', { 'style': 'font-size:15px;font-weight:bold;color:' + color }, label)
@@ -241,9 +243,9 @@ return view.extend({
 			var cloudText;
 
 			if (!confirmed || cloud === 'unknown')
-				cloudText = _('尚未成功上报（本地记录，未向云端查询）');
+				cloudText = _('尚未成功推送到云端（本地记录，未向云端查询）');
 			else
-				cloudText = _('云端已上报：%s（本地记录，未向云端查询）').format(cloudLabel);
+				cloudText = _('已确认推送到云端：%s（推送成功时的本地记录，非云端实时查询）').format(cloudLabel);
 
 			if (pending)
 				cloudText += _(' ｜ 有新状态待同步，插件会自动补发');
@@ -262,7 +264,9 @@ return view.extend({
 		o.onclick = function() { window.location.reload(); };
 
 		o = s.option(form.Button, '_st_probe', _('重新探测'),
-			_('立即探测一次目标机状态并写入状态快照，不改变电脑开关状态。'));
+			_('立即探测一次目标机状态并写入状态快照，不改变电脑开关状态。' +
+			  '2.2.2 起：探测结果与云端记录不一致时会自动推送给巴法云' +
+			  '（受 60 秒同步窗口节流，被拦下会标记待同步并自动补发）。'));
 		o.inputtitle = _('重新探测');
 		o.inputstyle = 'action';
 		o.onclick = function() {

@@ -625,90 +625,12 @@ static void log_write(const char *level, const char *fmt, ...)
 static const char *cc_home_dir(void);
 
 /*
- * run_argv - fork + execvp 执行外部命令，返回其退出码。
- *
- * argv        以 NULL 结尾的参数数组，argv[0] 为程序名
- * env_name    需要额外注入的环境变量名（可为 NULL）
- * env_val     对应值（可为 NULL）
- *
- * 返回值：>=0 为子进程退出码；-1 为 fork/exec 失败。
- * 非 verbose 模式下子进程 stdout/stderr 重定向到 /dev/null，
- * 避免污染 procd 的日志管道。
- */
-static int run_argv(char *const argv[], const char *env_name, const char *env_val)
-{
-    pid_t pid;
-    int status = 0;
-
-    if (argv == NULL || argv[0] == NULL)
-        return -1;
-
-    pid = fork();
-    if (pid < 0) {
-        log_write("ERROR", "fork 失败：%s", strerror(errno));
-        return -1;
-    }
-
-    if (pid == 0) {
-        int fd;
-
-        /* 子进程：注入环境变量（SSHPASS 只存在于子进程环境，父进程不受污染） */
-        if (env_name != NULL && env_val != NULL)
-            setenv(env_name, env_val, 1);
-
-        /*
-         * procd 拉起的进程环境非常干净，HOME 往往是空的。
-         * dbclient 用 $HOME 拼私钥路径（~/.ssh/id_dropbear），
-         * HOME 缺失就找不到密钥 → 回落到密码认证 → 没有终端可输 →
-         * 会话在认证阶段就断掉。手动在 shell 里跑没有这个问题。
-         */
-        setenv("HOME", cc_home_dir(), 1);
-
-        if (!g_verbose) {
-            fd = open("/dev/null", O_RDWR);
-            if (fd >= 0) {
-                dup2(fd, STDIN_FILENO);
-                dup2(fd, STDOUT_FILENO);
-                dup2(fd, STDERR_FILENO);
-                if (fd > STDERR_FILENO)
-                    close(fd);
-            }
-        }
-
-        /*
-         * 关掉继承来的多余 fd。
-         * 关键是巴法云的长连接 socket：curl/ssh 最长会跑 8 秒，
-         * 若被子进程继承，父进程 close() 也要等子进程退出才真正 FIN，
-         * 重连时可能撞上巴法云「同一私钥长连接数」的限制。
-         */
-        for (fd = STDERR_FILENO + 1; fd < 256; fd++)
-            close(fd);
-
-        execvp(argv[0], argv);
-        /* exec 失败 */
-        _exit(127);
-    }
-
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            log_write("ERROR", "waitpid 失败：%s", strerror(errno));
-            return -1;
-        }
-        /* 被信号打断则继续等待，避免僵尸进程 */
-    }
-
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-
-    if (WIFSIGNALED(status))
-        return 128 + WTERMSIG(status);
-
-    return -1;
-}
-
-/*
- * run_argv_capture - 执行命令并捕获它的标准输出（含 stderr）。
+ * run_argv_capture - fork + execvp 执行外部命令并捕获它的标准输出（含 stderr）。
  * 返回退出码；-1 表示 pipe/fork 失败。输出超过 outsz 的部分丢弃。
+ *
+ * 2.2.2 起这是外部命令的唯一出口：原先不带捕获的 run_argv 只剩 bemfa_push
+ * 一个调用方，而 bemfa_push 改为解析响应业务码后也走捕获版本，run_argv
+ * 成了死代码，直接删除（行为不变，只是少一份重复实现）。
  */
 static int run_argv_capture(char *const argv[], const char *env_name,
                            const char *env_val, int timeout_sec,
@@ -1190,14 +1112,16 @@ static int cfg_load(cc_config_t *cfg)
 /* 巴法云上报                                                         */
 /* ------------------------------------------------------------------ */
 
-/* 向巴法云推送设备状态（on / off），返回 curl 退出码。 */
+/* 向巴法云推送设备状态（on / off），返回 0 表示确认送达。 */
 static int bemfa_push(const cc_config_t *cfg, const char *msg)
 {
     char uid_enc[384];
     char topic_enc[384];
     char url[1024];
+    char resp[512];
     char *argv[8];
     char curl_bin[256];
+    long code = -1;
     int rc;
 
     if (cfg == NULL || msg == NULL)
@@ -1221,22 +1145,47 @@ static int bemfa_push(const cc_config_t *cfg, const char *msg)
 
     argv[0] = curl_bin;
     argv[1] = (char *)"-s";
-    argv[2] = (char *)"-f";     /* 业务错误码返回非 0，避免误记为上报成功 */
+    argv[2] = (char *)"-f";     /* HTTP 层错误返回非 0，避免误记为上报成功 */
     argv[3] = (char *)"--max-time";
     argv[4] = (char *)"8";
     argv[5] = url;
     argv[6] = NULL;
 
-    rc = run_argv(argv, NULL, NULL);
+    rc = run_argv_capture(argv, NULL, NULL, 15, resp, sizeof(resp));
     if (rc != 0) {
         log_write("WARN", "云端上报 msg=%s 失败（curl exit=%d）", msg, rc);
-    } else {
-        /* 只有真正发出去了才记录，供 handle_cmd 做自回显去重 */
-        cc_strlcpy(g_last_push_msg, msg, sizeof(g_last_push_msg));
-        g_last_push_time = time(NULL);
+        return rc;
     }
 
-    return rc;
+    /*
+     * 2.2.2：HTTP 200 不等于业务成功。主题填错等情况下巴法云会返回
+     * HTTP 200 + {"code":"40212","status":"topic error"}，curl -f 拦不住，
+     * 旧版会把这种失败记成「已确认上报」——页面显示云端已开机，
+     * 巴法云的 msg 却从没变过。这里复用 json_get_code 解析业务码：
+     * code!=0 按失败处理（返回 -1，由 cloud_report 置待同步标记补发）；
+     * 解析不出 code 时保持旧行为按成功处理，但把响应脱敏后记一条 WARN 留痕。
+     */
+    if (json_get_code(resp, &code)) {
+        if (code != 0) {
+            char safe[512];
+
+            redact_secrets(resp, safe, sizeof(safe));
+            log_write("ERROR", "云端上报 msg=%s 被巴法云拒绝（code=%ld）：%s",
+                      msg, code, safe);
+            return -1;
+        }
+    } else if (resp[0] != '\0') {
+        char safe[512];
+
+        redact_secrets(resp, safe, sizeof(safe));
+        log_write("WARN", "云端上报响应无法解析业务码（按成功处理）：%s", safe);
+    }
+
+    /* 只有真正发出去了才记录，供 handle_cmd 做自回显去重 */
+    cc_strlcpy(g_last_push_msg, msg, sizeof(g_last_push_msg));
+    g_last_push_time = time(NULL);
+
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2044,6 +1993,7 @@ static void state_flatten(char *s)
  *
  * 状态文件由守护进程和 -t 单次命令共享。若不读回，页面点一次「重新探测」
  * 就会开一个新进程、把 cloud= 清成「尚未成功上报」，守护进程重启同理。
+ * 同时恢复 cloud_pushed_at（上次成功推送时刻），让 60 秒同步窗口跨进程生效；
  * 读不到就保持全零（如实表示未知），绝不假装已经上报成功。
  */
 static void state_file_restore_cloud(void)
@@ -2074,6 +2024,15 @@ static void state_file_restore_cloud(void)
         } else if (strncmp(line, "cloud_pending=", 14) == 0) {
             v = line + 14;
             g_state_dirty = (atoi(v) == 1) ? 1 : 0;
+        } else if (strncmp(line, "cloud_pushed_at=", 16) == 0) {
+            /*
+             * 2.2.2 起持久化「最后一次确认成功推送」的时刻：
+             * -t 单次命令（status / push）与守护进程是不同进程，只有把它
+             * 落盘，60 秒同步窗口才能跨进程生效，否则页面每点一次
+             * 「重新探测」都会绕过节流直接推一条。
+             */
+            v = line + 16;
+            g_state_push_at = (time_t)strtol(v, NULL, 10);
         }
     }
 
@@ -2119,6 +2078,7 @@ static void state_file_write(const cc_config_t *cfg)
             "cloud=%s\n"
             "cloud_confirmed=%d\n"
             "cloud_pending=%d\n"
+            "cloud_pushed_at=%ld\n"
             "pid=%d\n"
             "version=%s\n",
             state_name(g_host_state), updated, g_state_source, detail,
@@ -2127,6 +2087,7 @@ static void state_file_write(const cc_config_t *cfg)
             g_cloud_state[0] ? g_cloud_state : "unknown",
             g_cloud_confirmed ? 1 : 0,
             g_state_dirty ? 1 : 0,
+            (long)g_state_push_at,
             (int)getpid(), CC_VERSION);
 
     fclose(fp);
@@ -3366,7 +3327,7 @@ static void usage(const char *prog)
             "  -t wol       执行一次 Wake-on-LAN 测试\n"
             "  -t ssh       执行一次 SSH 关机测试\n"
             "  -t cloud     测试巴法云连接（8 秒超时）\n"
-            "  -t status    重新探测目标机状态并写入状态文件\n"
+            "  -t status    重新探测目标机状态并写入状态文件，与云端记录不一致时同步上报\n"
             "  -t on        立即开机（已是开机状态则幂等跳过）\n"
             "  -t off       立即关机（已是关机状态则幂等跳过）\n"
             "  -t retry     按状态文件记录的最后一次动作重做一次\n"
@@ -3513,11 +3474,49 @@ int main(int argc, char **argv)
                      (st == HOST_ON) ? "可连接" : "无响应");
             state_force(&cfg, st, "manual", detail);
 
+            /*
+             * 2.2.2：手动探测得出的状态也是一次「本地状态变化」，不能只写
+             * 状态文件就返回 —— 旧版在这里直接结束，云端永远停在旧值，
+             * 守护进程没在跑时更是连补发的机会都没有（本版实测复现：
+             * 页面显示已开机、巴法云 msg 一直是 off）。
+             * 现在走统一的「标记 → 补发」链路：与云端记录不一致时，
+             * 同步窗口外立即推送；被 STATE_PUSH_MIN_GAP 节流拦下则留下
+             * cloud_pending=1（节流起点 cloud_pushed_at 已随状态文件持久化），
+             * 由守护进程的周期补发或下一次手动操作补齐。
+             */
+            if (st != HOST_UNKNOWN) {
+                state_mark_dirty(&cfg);
+                state_sync_pending(&cfg, time(NULL));
+                state_file_write(&cfg);   /* 刷新 cloud= / confirmed / pending / pushed_at */
+            }
+
             fprintf(stdout,
                     "当前状态：%s\n"
                     "判定依据：%s\n"
                     "状态文件：%s\n",
                     state_name(st), detail, STATE_PATH);
+
+            /* 如实告知云端同步结果：页面标签与真实推送不能脱节 */
+            if (st == HOST_UNKNOWN) {
+                fprintf(stdout, "云端同步：未执行 - 未能确定目标机状态\n");
+            } else if (!state_sync_allowed(&cfg)) {
+                fprintf(stdout,
+                        "云端同步：未执行 - 需要 enabled=1、state_sync=1"
+                        " 且已配置 Client ID\n");
+            } else if (g_cloud_confirmed &&
+                       strcmp(g_cloud_state, state_name(st)) == 0) {
+                fprintf(stdout,
+                        "云端同步：已上报 %s（推送成功时的本地记录，非云端实时查询）\n",
+                        g_cloud_state);
+            } else if (g_state_dirty) {
+                fprintf(stdout,
+                        "云端同步：暂未推送到云端，已记为待同步"
+                        "（cloud_pending=1，在等 60 秒同步窗口或推送失败退避），"
+                        "守护进程会自动补发\n");
+            } else {
+                fprintf(stdout, "云端同步：未执行\n");
+            }
+
             rc = (st == HOST_UNKNOWN) ? 1 : 0;
 
         } else if (strcmp(test_mode, "on") == 0 ||
